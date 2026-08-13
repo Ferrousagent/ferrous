@@ -1,0 +1,13 @@
+[package]
+name = "router"
+description = "Model auto-routing calculator, COTP smart token pipeline, and Mermaid agent routing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

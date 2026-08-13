@@ -1,56 +1,50 @@
-# ferrous
+# Ferrous
 
-A local-first AI IDE brain — Rust core + CLI, built to power a Tauri desktop shell later.
+A local-first AI IDE that rivals Cursor / Windsurf / Manus: a CodeMirror editor (Stage),
+a Framer-style drag-and-drop canvas, and a WASI-hosted environment (terminal + rendered
+browser) the AI itself uses. Rust + WASI backend, Tauri v2 shell, React + Vite frontend.
 
-Current phase: **headless backend**. The UI is deliberately not built yet; the product is a testable Rust workspace that a Tauri app will eventually wrap.
+**Status:** Phase 0 — foundation scaffold. No UI yet. See
+[`docs/plans/ferrous-roadmap-spec.md`](docs/plans/ferrous-roadmap-spec.md) for the full plan.
 
-## Layout
+## Repository layout
 
 ```
-Cargo.toml            workspace + shared deps + zero-bloat release profile (LTO, strip)
-ferrous-core/         the brain — pure Rust, no UI, no network at runtime
-ferrous-cli/          `ferrous` terminal command
-docs/                 design references (Linear dark tokens for the future UI)
+crates/
+  ferrous/          CLI binary (headless) — `ferrous shell`
+  shared/           cross-cutting types: errors, secrets, version
+  wasi-runtime/     WASI runtime + shell + sandbox framework   (Phase 1)
+  context-index/    Graphify: AST + LSP + embeddings           (Phase 3)
+  agent-loop/       agent loop + subagents + skills            (Phase 4)
+  router/           model routing + COTP + Mermaid             (Phase 2)
+  model-client/     unified local + cloud model client         (Phase 2)
+  profiles-vault/   profiles + master-password vault + secrets (Phase 2)
+  search/           local lightweight search engine            (Phase 5)
+  services/         git, reviewer, scanner, MCP, skills, completion (Phase 5)
+docs/
+  adr/              architecture decision records
+  plans/            roadmap spec (`ferrous-roadmap-spec.md`) + original brief (`plan`)
 ```
 
-### ferrous-core
+## Build & run
 
-| Module | What it does |
-|---|---|
-| `model.rs` | `Model` + `Benchmarks` — price, context window, TPM/RPM, tools/vision, region |
-| `catalog.rs` | In-memory catalog — HashMap slug index, `cheapest()`, `capable()`, `search()` |
-| `sources.rs` | LiteLLM + OpenRouter JSON parsers + bundled offline fallback snapshot |
-| `sync.rs` | Injectable fetcher (headless-testable), best-effort network sync |
-| `snapshot.rs` | postcard persistence, atomic pid-unique tmp+rename |
-| `config.rs` | `~/.ferrous/config.toml`, env overrides, redacted secrets |
-| `error.rs` | Typed errors, zero panics |
-
-## CLI
-
-```sh
-ferrous config init          # create ~/.ferrous/config.toml
-ferrous config show          # masked keys
-ferrous models list          # all models, sorted by price
-ferrous models search <q>    # e.g. ferrous models search deepseek
-ferrous models info <slug>   # benchmarks + region
-ferrous sync                 # refresh catalog from remote sources (falls back offline)
+```bash
+cargo build --workspace
+cargo run -p ferrous -- shell   # interactive shell (Phase 0 built-ins only)
 ```
 
-Works offline out of the box — the bundled snapshot means first run needs no network.
+## Quality gates
 
-## Dev
-
-```sh
-cargo test          # 18 tests — catalog, snapshot, config, sources, merge
-cargo clippy        # zero warnings
-cargo fmt           # rustfmt
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo bench --workspace --no-run
+cargo deny check licenses advisories bans sources   # requires `cargo-deny`
 ```
 
-## Roadmap (next ticks)
+## License
 
-1. Router with fallback — `ferrous route "hello"` picks cheapest capable model, survives dead providers, tracks cost
-2. Agent graph + executor (JSON + Mermaid specs)
-3. Bastallion — wasmtime sandbox for untrusted code
-4. OSV security gate — block vulnerable packages before install
-5. GitHub deps layer — octocrab "12 updates available" panel
-6. Tauri shell on top — re-scaffold frontend with `create-tauri-app`, apply tokens from `docs/design-linear-tokens.md`
+The workspace is provisionally dual-licensed `MIT OR Apache-2.0` while commercial-vs-open
+source is undecided. Dependencies are **permissive-only** (see `deny.toml` and
+`docs/adr/0001-permissive-only-dependency-policy.md`).

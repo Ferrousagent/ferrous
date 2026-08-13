@@ -1,0 +1,13 @@
+[package]
+name = "agent-loop"
+description = "Custom Rust agent engine: loop, subagents, skills runtime, structured plan model, state and interrupt."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
