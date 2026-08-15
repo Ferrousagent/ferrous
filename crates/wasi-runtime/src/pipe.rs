@@ -1,7 +1,8 @@
 //! Bounded, incrementally readable output pipes for live session streaming.
 //!
-//! [`MemoryOutputPipe`] captures a whole guest's output but offers no way to
-//! read it until the guest finishes. [`StreamOutputPipe`] keeps the same
+//! [`wasmtime_wasi::p2::pipe::MemoryOutputPipe`] captures a whole guest's
+//! output but offers no way to read it until the guest finishes.
+//! [`StreamOutputPipe`] keeps the same
 //! capped-write semantics (writing beyond capacity traps the guest, exactly as
 //! the non-streaming path does) while letting a reader drain bytes as they are
 //! produced, which is what the UI-boundary event stream is built on.
