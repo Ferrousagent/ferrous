@@ -2,9 +2,9 @@
 # See docs/adr/0001-permissive-only-dependency-policy.md.
 
 [licenses]
-# Copyleft (GPL/AGPL/LGPL/SSPL/MPL) is denied project-wide.
-copyleft = "deny"
-# Allowlist of permissive licenses.
+# cargo-deny v2: every license not in `allow` is denied by default, so the
+# allowlist below enforces the permissive-only policy (copyleft like
+# GPL/AGPL/LGPL/SSPL/MPL is excluded implicitly).
 allow = [
     "MIT",
     "Apache-2.0",
