@@ -1,0 +1,23 @@
+name: build-release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release -p ferrous
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferrous-${{ matrix.os }}
+          path: |
+            target/release/ferrous
+            target/release/ferrous.exe
+          if-no-files-found: error
