@@ -31,7 +31,7 @@ clap = { version = "4", features = ["derive"] }
 # plaintext (expose_secret) for sized wrappers. No secret type must be serializable;
 # secrets leave the crate only via an explicit `expose_secret()` boundary.
 secrecy = "0.10"
-criterion = "0.5"
+criterion = "0.8"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
