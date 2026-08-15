@@ -127,6 +127,13 @@ impl ResourceLimits {
         Ok(self)
     }
 
+    /// Raise the instruction-count bound beyond any practical execution so the
+    /// guest runs until the wall-clock timeout (or cancellation) stops it.
+    pub const fn with_unlimited_fuel(mut self) -> Self {
+        self.max_fuel = u64::MAX;
+        self
+    }
+
     /// Set the maximum size of each guest linear memory.
     pub const fn with_memory_bytes(
         mut self,
@@ -264,6 +271,14 @@ impl CapabilityGrant {
         self.environment.contains(name)
     }
 
+    pub(crate) fn environment_names(&self) -> impl Iterator<Item = &str> {
+        self.environment.iter().map(String::as_str)
+    }
+
+    pub(crate) fn loopback_ports(&self) -> &BTreeSet<u16> {
+        &self.loopback_ports
+    }
+
     /// Whether a loopback TCP port is allowed.
     pub fn allows_loopback_port(&self, port: u16) -> bool {
         self.loopback_ports.contains(&port)
@@ -337,6 +352,12 @@ mod tests {
         assert!(limits.with_fuel(0).is_err());
         assert!(limits.with_memory_bytes(0).is_err());
         assert_eq!(limits.max_fuel(), 1_000_000);
+    }
+
+    #[test]
+    fn unlimited_fuel_uses_the_sentinel() {
+        let limits = ResourceLimits::new(1024, 30).expect("valid limits");
+        assert_eq!(limits.with_unlimited_fuel().max_fuel(), u64::MAX);
     }
 
     #[test]

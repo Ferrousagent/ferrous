@@ -10,6 +10,7 @@ pub mod cancel;
 pub mod capability;
 pub mod command;
 pub mod native;
+pub mod policy;
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -150,6 +151,18 @@ impl WasiRuntime {
         builder.stdout(stdout.clone());
         builder.stderr(stderr.clone());
 
+        // Environment: only allowlisted names propagate from the host process.
+        // The allowlist is the policy; a name that is not granted is never read.
+        for (name, value) in
+            policy::selected_environment(&request.grant, &|name| std::env::var(name).ok())
+        {
+            builder.env(name, value);
+        }
+        // Networking: explicit default-deny. Without this, wasmtime's socket
+        // posture is an undocumented default; Ferrous makes it a tested policy.
+        let network = policy::NetworkPolicy::from_grant(&request.grant);
+        network.apply(&mut builder);
+
         let mut cwd_guest = None;
         for (index, filesystem) in request.grant.filesystem_grants().enumerate() {
             let guest_root = if index == 0 {
@@ -197,6 +210,10 @@ impl WasiRuntime {
             },
         );
         store.limiter(|state| &mut state.limits);
+        // Fuel bounds guest work; `with_unlimited_fuel` raises it beyond any
+        // practical execution. The wall-clock epoch deadline stays the hard
+        // limit either way. (Fuel accounting itself is engine-level config and
+        // always on for the Phase 1 engine.)
         store
             .set_fuel(request.grant.limits().max_fuel())
             .map_err(RuntimeError::Wasi)?;
@@ -397,6 +414,47 @@ mod contract_tests {
             runtime.run_wasi(&component, &request),
             Err(RuntimeError::Command(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_denies_a_symlinked_cwd_that_escapes_the_grant() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("symlink-escape");
+        let outside = test_root("symlink-escape-outside");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&root).expect("grant root is created");
+        std::fs::create_dir_all(&outside).expect("outside directory is created");
+        symlink(&outside, root.join("escape")).expect("escape symlink is created");
+
+        let runtime = WasiRuntime::new().expect("runtime configuration is valid");
+        let component = runtime
+            .compile_component(&wat::parse_str("(component)").expect("component is valid"))
+            .expect("component admission succeeds");
+        let grant = CapabilityGrant::workspace(&root, FilesystemAccess::ReadWrite)
+            .expect("absolute capability path");
+        // The cwd passes the lexical check but resolves outside the grant.
+        let escaped_cwd = root.join("escape");
+        let request = CommandRequest::new(
+            10,
+            Actor::Agent,
+            ExecutionMode::Wasi,
+            "tool",
+            std::iter::empty::<&str>(),
+            &escaped_cwd,
+            grant,
+        )
+        .expect("lexically valid request");
+
+        assert!(matches!(
+            runtime.run_wasi(&component, &request),
+            Err(RuntimeError::Command(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

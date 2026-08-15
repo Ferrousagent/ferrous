@@ -18,11 +18,18 @@ use crate::cancel::CancelHandle;
 use crate::command::{CommandError, CommandRequest, ExecutionMode, SessionEvent, SessionState};
 use crate::{RuntimeError, WasiOutput, WasiRuntime};
 
+/// Maximum number of sessions a broker will hold before rejecting submissions.
+///
+/// The bound protects the host from a runaway agent flooding the queue with
+/// unacknowledged work; sessions are released as they complete.
+pub const DEFAULT_MAX_OUTSTANDING_SESSIONS: usize = 64;
+
 /// Errors produced while interacting with the broker.
 #[derive(Debug, Error)]
 pub enum BrokerError {
-    /// The session id was never submitted to this broker.
-    #[error("no session with id {0} is known to the broker")]
+    /// The session id is not a *live* session of this broker (never submitted,
+    /// or already finished and released).
+    #[error("no live session with id {0}")]
     UnknownSession(u64),
     /// The worker thread stopped, so the queue is no longer served.
     #[error("the broker worker stopped unexpectedly")]
@@ -36,6 +43,12 @@ pub enum BrokerError {
     /// The underlying runtime could not be created or configured.
     #[error("runtime failure: {0}")]
     Runtime(#[from] RuntimeError),
+    /// The number of outstanding sessions would exceed the broker capacity.
+    #[error("broker capacity exceeded; cancel or wait for a running session")]
+    QueueFull,
+    /// The broker capacity must be greater than zero.
+    #[error("broker capacity must be greater than zero")]
+    InvalidCapacity,
 }
 
 /// Final result of one broker-managed session.
@@ -64,12 +77,22 @@ pub struct ActionBroker {
     engine: wasmtime::Engine,
     queue_tx: mpsc::Sender<Job>,
     handles: Arc<Mutex<HashMap<u64, CancelHandle>>>,
+    capacity: usize,
     worker: Option<JoinHandle<()>>,
 }
 
 impl ActionBroker {
-    /// Create a broker with a fresh runtime and one worker thread.
+    /// Create a broker with a fresh runtime, one worker thread, and the default
+    /// outstanding-session capacity.
     pub fn new() -> Result<Self, BrokerError> {
+        Self::with_capacity(DEFAULT_MAX_OUTSTANDING_SESSIONS)
+    }
+
+    /// Create a broker with a custom outstanding-session capacity.
+    pub fn with_capacity(capacity: usize) -> Result<Self, BrokerError> {
+        if capacity == 0 {
+            return Err(BrokerError::InvalidCapacity);
+        }
         let runtime = WasiRuntime::new()?;
         let engine = runtime.engine().clone();
         let (queue_tx, queue_rx) = mpsc::channel::<Job>();
@@ -80,8 +103,18 @@ impl ActionBroker {
             engine,
             queue_tx,
             handles,
+            capacity,
             worker: Some(worker),
         })
+    }
+
+    /// Number of sessions currently held by the broker (running plus queued).
+    #[cfg(test)]
+    fn outstanding_sessions(&self) -> usize {
+        self.handles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     /// Admit and compile a component on this broker's engine.
@@ -106,28 +139,37 @@ impl ActionBroker {
         if request.mode != ExecutionMode::Wasi {
             return Err(BrokerError::NotWasi);
         }
+        let id = request.id;
+        let mut handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
+        if handles.len() >= self.capacity {
+            return Err(BrokerError::QueueFull);
+        }
         let handle = CancelHandle::new();
-        self.handles
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(request.id, handle);
+        handles.insert(id, handle);
+        drop(handles);
         let (result_tx, result_rx) = mpsc::channel();
         let job = Job {
-            session: SessionState::new(request.id, request.grant.limits()),
+            session: SessionState::new(id, request.grant.limits()),
             request,
             component,
             result_tx,
         };
-        self.queue_tx
-            .send(job)
-            .map_err(|_| BrokerError::WorkerStopped)?;
+        if self.queue_tx.send(job).is_err() {
+            // The worker is gone; do not leave a phantom session registered.
+            self.handles
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&id);
+            return Err(BrokerError::WorkerStopped);
+        }
         Ok(result_rx)
     }
 
     /// Request cancellation of a live session.
     ///
-    /// Safe to call more than once and for sessions that already finished;
-    /// only ids that were never submitted are rejected.
+    /// Safe to call more than once; ids that are no longer live (never submitted
+    /// or already finished and released) are rejected with
+    /// [`BrokerError::UnknownSession`].
     pub fn cancel(&self, id: u64) -> Result<(), BrokerError> {
         let handle = self
             .handles
@@ -176,6 +218,12 @@ fn worker_loop(
             )),
         };
         let _ = job.result_tx.send(outcome);
+        // Release the session now that it reached a terminal state so the map
+        // does not grow without bound across a long-lived broker.
+        handles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&job.request.id);
     }
 }
 
@@ -415,5 +463,98 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("cancelled promptly");
         assert!(matches!(outcome, BrokerOutcome::Cancelled));
+    }
+
+    #[test]
+    fn completed_sessions_release_their_handles() {
+        let broker = ActionBroker::new().expect("broker");
+        let (component, request) = request(&broker, 1, "hello", HELLO_WAT, grant(30, 1_000_000));
+        let receiver = broker.submit(component, request).expect("submitted");
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("session completes");
+
+        for _ in 0..50 {
+            if broker.outstanding_sessions() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            broker.outstanding_sessions(),
+            0,
+            "finished sessions must be released from the broker"
+        );
+    }
+
+    #[test]
+    fn cancel_after_completion_reports_unknown_session() {
+        let broker = ActionBroker::new().expect("broker");
+        let (component, request) = request(&broker, 1, "hello", HELLO_WAT, grant(30, 1_000_000));
+        let receiver = broker.submit(component, request).expect("submitted");
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("session completes");
+
+        for _ in 0..50 {
+            if broker.outstanding_sessions() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(
+            broker.cancel(1),
+            Err(BrokerError::UnknownSession(1))
+        ));
+    }
+
+    #[test]
+    fn queue_rejects_submissions_beyond_capacity() {
+        let broker = ActionBroker::with_capacity(2).expect("broker");
+        let (component_a, request_a) =
+            request(&broker, 1, "spin-a", SPIN_WAT, grant(60, 4_000_000_000));
+        let (component_b, request_b) =
+            request(&broker, 2, "spin-b", SPIN_WAT, grant(60, 4_000_000_000));
+        let (component_c, request_c) =
+            request(&broker, 3, "spin-c", SPIN_WAT, grant(60, 4_000_000_000));
+
+        broker.submit(component_a, request_a).expect("first fits");
+        broker.submit(component_b, request_b).expect("second fits");
+        assert!(matches!(
+            broker.submit(component_c, request_c),
+            Err(BrokerError::QueueFull)
+        ));
+    }
+
+    #[test]
+    fn zero_capacity_is_rejected() {
+        assert!(matches!(
+            ActionBroker::with_capacity(0),
+            Err(BrokerError::InvalidCapacity)
+        ));
+    }
+
+    #[test]
+    fn hello_runs_with_unlimited_fuel() {
+        let broker = ActionBroker::new().expect("broker");
+        let (component, request) = request(
+            &broker,
+            1,
+            "hello",
+            HELLO_WAT,
+            grant(30, 1_000_000).with_limits(
+                ResourceLimits::new(1_048_576, 30)
+                    .expect("valid limits")
+                    .with_unlimited_fuel(),
+            ),
+        );
+        let receiver = broker.submit(component, request).expect("submitted");
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("result within 10s");
+        match outcome {
+            BrokerOutcome::Completed(output) => assert_eq!(output.exit_code, 0),
+            other => panic!("expected completion, got {other:?}"),
+        }
     }
 }
