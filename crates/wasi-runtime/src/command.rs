@@ -238,10 +238,17 @@ impl SessionState {
 mod tests {
     use super::*;
 
+    fn absolute_test_workspace() -> std::path::PathBuf {
+        // Rooted in the platform temp directory so the path is absolute on every
+        // OS; a bare `/workspace` is not absolute on Windows.
+        std::env::temp_dir().join("ferrous-test-workspace")
+    }
+
     #[test]
     fn native_request_with_workspace_and_grant_is_valid() {
+        let workspace = absolute_test_workspace();
         let grant =
-            CapabilityGrant::workspace("/workspace", crate::capability::FilesystemAccess::Read)
+            CapabilityGrant::workspace(&workspace, crate::capability::FilesystemAccess::Read)
                 .expect("workspace is absolute")
                 .allow_native_execution();
         let request = CommandRequest::new(
@@ -250,7 +257,7 @@ mod tests {
             ExecutionMode::Native,
             "cargo",
             ["test"],
-            "/workspace",
+            &workspace,
             grant,
         );
         assert!(request.is_ok());

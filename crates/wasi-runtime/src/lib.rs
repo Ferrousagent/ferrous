@@ -207,9 +207,15 @@ impl WasiRuntime {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod contract_tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use super::capability::{CapabilityGrant, FilesystemAccess, ResourceLimits};
+
+    /// Build an absolute test root on any platform; a bare `/workspace` path is
+    /// not absolute on Windows, which would make capability construction fail.
+    fn test_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ferrous-{name}-{}", std::process::id()))
+    }
     use super::command::{
         Actor, CommandRequest, ExecutionMode, SessionEvent, SessionState, Stream,
     };
@@ -227,12 +233,13 @@ mod contract_tests {
 
     #[test]
     fn workspace_grant_does_not_cross_path_boundaries_or_parent_segments() {
-        let grant = CapabilityGrant::workspace("/workspace/project", FilesystemAccess::ReadWrite)
+        let project = test_root("project");
+        let grant = CapabilityGrant::workspace(&project, FilesystemAccess::ReadWrite)
             .expect("absolute workspace path");
 
-        assert!(grant.allows_path(Path::new("/workspace/project/src/main.rs")));
-        assert!(!grant.allows_path(Path::new("/workspace/project-other/main.rs")));
-        assert!(!grant.allows_path(Path::new("/workspace/project/../secrets.txt")));
+        assert!(grant.allows_path(&project.join("src/main.rs")));
+        assert!(!grant.allows_path(&test_root("project-other").join("main.rs")));
+        assert!(!grant.allows_path(&project.join("../secrets.txt")));
     }
 
     #[test]
@@ -275,7 +282,8 @@ mod contract_tests {
 
     #[test]
     fn native_backend_never_falls_back_to_ambient_execution() {
-        let grant = CapabilityGrant::workspace("/workspace", FilesystemAccess::ReadWrite)
+        let workspace = test_root("native-workspace");
+        let grant = CapabilityGrant::workspace(&workspace, FilesystemAccess::ReadWrite)
             .expect("workspace is absolute")
             .allow_native_execution();
         let request = CommandRequest::new(
@@ -284,7 +292,7 @@ mod contract_tests {
             ExecutionMode::Native,
             "bash",
             ["-lc", "echo unsafe"],
-            "/workspace",
+            &workspace,
             grant,
         )
         .expect("explicit native request is valid");
@@ -310,18 +318,16 @@ mod contract_tests {
         let component = runtime
             .compile_component(&wat::parse_str("(component)").expect("component is valid"))
             .expect("component admission succeeds");
-        let grant = CapabilityGrant::workspace(
-            "/ferrous-test-workspace-that-does-not-exist",
-            FilesystemAccess::ReadWrite,
-        )
-        .expect("absolute capability path");
+        let missing = test_root("missing-workspace-that-does-not-exist");
+        let grant = CapabilityGrant::workspace(&missing, FilesystemAccess::ReadWrite)
+            .expect("absolute capability path");
         let request = CommandRequest::new(
             9,
             Actor::Agent,
             ExecutionMode::Wasi,
             "tool",
             std::iter::empty::<&str>(),
-            "/ferrous-test-workspace-that-does-not-exist",
+            &missing,
             grant,
         )
         .expect("lexically valid request");
