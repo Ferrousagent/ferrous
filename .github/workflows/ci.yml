@@ -29,7 +29,7 @@ jobs:
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install mold linker (Linux)
         run: sudo apt-get update && sudo apt-get install -y mold
@@ -68,7 +68,7 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -89,7 +89,7 @@ jobs:
     name: license + advisory checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check licenses, advisories, bans, sources
         uses: EmbarkStudios/cargo-deny-action@v2
