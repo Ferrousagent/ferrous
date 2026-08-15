@@ -64,11 +64,19 @@ pub enum BrokerOutcome {
     Failed(RuntimeError),
 }
 
+/// Where a finished (or live-streamed) job reports its terminal state.
+enum JobSink {
+    /// Capturing mode: exactly one [`BrokerOutcome`] at the end.
+    Outcome(mpsc::Sender<BrokerOutcome>),
+    /// Streaming mode: live [`SessionEvent`]s in lifecycle order.
+    Events(mpsc::Sender<SessionEvent>),
+}
+
 /// One queued or running execution.
 struct Job {
     request: CommandRequest,
     component: Component,
-    result_tx: mpsc::Sender<BrokerOutcome>,
+    sink: JobSink,
     session: SessionState,
 }
 
@@ -129,6 +137,9 @@ impl ActionBroker {
     /// Enqueue an admitted component for execution.
     ///
     /// Returns a channel that receives exactly one [`BrokerOutcome`] when the
+    /// session reaches a terminal state.    /// Enqueue an admitted component for capturing execution.
+    ///
+    /// Returns a channel that receives exactly one [`BrokerOutcome`] when the
     /// session reaches a terminal state.
     pub fn submit(
         &self,
@@ -139,7 +150,45 @@ impl ActionBroker {
         if request.mode != ExecutionMode::Wasi {
             return Err(BrokerError::NotWasi);
         }
-        let id = request.id;
+        let (result_tx, result_rx) = mpsc::channel();
+        let job = Job {
+            session: SessionState::new(request.id, request.grant.limits()),
+            request,
+            component,
+            sink: JobSink::Outcome(result_tx),
+        };
+        self.enqueue(job)?;
+        Ok(result_rx)
+    }
+
+    /// Enqueue an admitted component and stream its live session events.
+    ///
+    /// The receiver yields [`SessionEvent`]s in lifecycle order: `Started`,
+    /// zero or more `Output` chunks as the guest produces them, then a
+    /// terminal event (`Exited`, `Cancelled`, `Denied`, or `Unsupported`).
+    pub fn submit_streaming(
+        &self,
+        component: Component,
+        request: CommandRequest,
+    ) -> Result<mpsc::Receiver<SessionEvent>, BrokerError> {
+        request.validate()?;
+        if request.mode != ExecutionMode::Wasi {
+            return Err(BrokerError::NotWasi);
+        }
+        let (event_tx, event_rx) = mpsc::channel();
+        let job = Job {
+            session: SessionState::new(request.id, request.grant.limits()),
+            request,
+            component,
+            sink: JobSink::Events(event_tx),
+        };
+        self.enqueue(job)?;
+        Ok(event_rx)
+    }
+
+    /// Register, queue, and bound-check one job.
+    fn enqueue(&self, job: Job) -> Result<(), BrokerError> {
+        let id = job.request.id;
         let mut handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
         if handles.len() >= self.capacity {
             return Err(BrokerError::QueueFull);
@@ -147,13 +196,6 @@ impl ActionBroker {
         let handle = CancelHandle::new();
         handles.insert(id, handle);
         drop(handles);
-        let (result_tx, result_rx) = mpsc::channel();
-        let job = Job {
-            session: SessionState::new(id, request.grant.limits()),
-            request,
-            component,
-            result_tx,
-        };
         if self.queue_tx.send(job).is_err() {
             // The worker is gone; do not leave a phantom session registered.
             self.handles
@@ -162,7 +204,7 @@ impl ActionBroker {
                 .remove(&id);
             return Err(BrokerError::WorkerStopped);
         }
-        Ok(result_rx)
+        Ok(())
     }
 
     /// Request cancellation of a live session.
@@ -211,13 +253,19 @@ fn worker_loop(
             .unwrap_or_else(PoisonError::into_inner)
             .get(&job.request.id)
             .cloned();
-        let outcome = match cancel {
+        match cancel {
             Some(cancel) => execute(&runtime, &mut job, &cancel),
-            None => BrokerOutcome::Denied(CommandError::InvalidTransition(
-                "session handle disappeared before start",
-            )),
-        };
-        let _ = job.result_tx.send(outcome);
+            None => match &job.sink {
+                JobSink::Outcome(result_tx) => {
+                    let _ = result_tx.send(BrokerOutcome::Denied(CommandError::InvalidTransition(
+                        "session handle disappeared before start",
+                    )));
+                }
+                JobSink::Events(event_tx) => {
+                    let _ = event_tx.send(SessionEvent::Denied);
+                }
+            },
+        }
         // Release the session now that it reached a terminal state so the map
         // does not grow without bound across a long-lived broker.
         handles
@@ -227,7 +275,21 @@ fn worker_loop(
     }
 }
 
-fn execute(runtime: &WasiRuntime, job: &mut Job, cancel: &CancelHandle) -> BrokerOutcome {
+/// Dispatch a job to its capturing or streaming execution path.
+fn execute(runtime: &WasiRuntime, job: &mut Job, cancel: &CancelHandle) {
+    let streams = matches!(&job.sink, JobSink::Events(_));
+    if streams {
+        execute_streaming(runtime, job, cancel);
+    } else {
+        let outcome = execute_capturing(runtime, job, cancel);
+        if let JobSink::Outcome(result_tx) = &job.sink {
+            let _ = result_tx.send(outcome);
+        }
+    }
+}
+
+/// Run a job to completion and return its final outcome.
+fn execute_capturing(runtime: &WasiRuntime, job: &mut Job, cancel: &CancelHandle) -> BrokerOutcome {
     if cancel.is_cancelled() {
         let _ = job.session.accept(SessionEvent::Cancelled);
         return BrokerOutcome::Cancelled;
@@ -252,6 +314,48 @@ fn execute(runtime: &WasiRuntime, job: &mut Job, cancel: &CancelHandle) -> Broke
         Err(error) => {
             let _ = job.session.accept(SessionEvent::Unsupported);
             BrokerOutcome::Failed(error)
+        }
+    }
+}
+
+/// Run a job while streaming live [`SessionEvent`]s to its event channel.
+///
+/// Output chunks are emitted as the guest produces them; the output budget is
+/// enforced structurally by the bounded pipes inside the runtime.
+fn execute_streaming(runtime: &WasiRuntime, job: &mut Job, cancel: &CancelHandle) {
+    let events = match &job.sink {
+        JobSink::Events(event_tx) => event_tx,
+        JobSink::Outcome(_) => return,
+    };
+    if cancel.is_cancelled() {
+        let _ = job.session.accept(SessionEvent::Cancelled);
+        let _ = events.send(SessionEvent::Cancelled);
+        return;
+    }
+    if job.session.accept(SessionEvent::Started).is_err() {
+        let _ = events.send(SessionEvent::Denied);
+        return;
+    }
+    let _ = events.send(SessionEvent::Started);
+    match runtime.run_wasi_events(&job.component, &job.request, cancel, events) {
+        Ok(output) => {
+            let _ = job.session.accept(SessionEvent::Exited {
+                code: Some(output.exit_code),
+            });
+            let _ = events.send(SessionEvent::Exited {
+                code: Some(output.exit_code),
+            });
+        }
+        Err(RuntimeError::Cancelled) => {
+            let _ = job.session.accept(SessionEvent::Cancelled);
+            let _ = events.send(SessionEvent::Cancelled);
+        }
+        Err(RuntimeError::WrongMode) => {
+            let _ = events.send(SessionEvent::Denied);
+        }
+        Err(_) => {
+            let _ = job.session.accept(SessionEvent::Unsupported);
+            let _ = events.send(SessionEvent::Unsupported);
         }
     }
 }
@@ -556,5 +660,98 @@ mod tests {
             BrokerOutcome::Completed(output) => assert_eq!(output.exit_code, 0),
             other => panic!("expected completion, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn streaming_hello_emits_started_then_exited() {
+        let broker = ActionBroker::new().expect("broker");
+        let (component, request) = request(&broker, 1, "hello", HELLO_WAT, grant(30, 1_000_000));
+        let events = broker
+            .submit_streaming(component, request)
+            .expect("submitted");
+
+        assert_eq!(
+            events
+                .recv_timeout(Duration::from_secs(10))
+                .expect("started event"),
+            SessionEvent::Started
+        );
+        assert_eq!(
+            events
+                .recv_timeout(Duration::from_secs(10))
+                .expect("exited event"),
+            SessionEvent::Exited { code: Some(0) }
+        );
+        assert!(
+            events.recv_timeout(Duration::from_millis(200)).is_err(),
+            "no events after the terminal one"
+        );
+    }
+
+    #[test]
+    fn streaming_cancel_interrupts_a_running_guest() {
+        let broker = ActionBroker::new().expect("broker");
+        let (component, request) = request(&broker, 1, "spin", SPIN_WAT, grant(60, 4_000_000_000));
+        let events = broker
+            .submit_streaming(component, request)
+            .expect("submitted");
+        assert_eq!(
+            events
+                .recv_timeout(Duration::from_secs(10))
+                .expect("started event"),
+            SessionEvent::Started
+        );
+
+        std::thread::sleep(Duration::from_millis(150));
+        broker.cancel(1).expect("running session is cancellable");
+
+        assert_eq!(
+            events
+                .recv_timeout(Duration::from_secs(5))
+                .expect("cancelled event"),
+            SessionEvent::Cancelled
+        );
+    }
+
+    #[test]
+    fn streaming_cancel_before_start_skips_a_queued_action() {
+        let broker = ActionBroker::new().expect("broker");
+        let (component_a, request_a) =
+            request(&broker, 1, "spin-a", SPIN_WAT, grant(60, 4_000_000_000));
+        let (component_b, request_b) =
+            request(&broker, 2, "hello-b", HELLO_WAT, grant(30, 1_000_000));
+        let events_a = broker
+            .submit_streaming(component_a, request_a)
+            .expect("a submitted");
+        let events_b = broker
+            .submit_streaming(component_b, request_b)
+            .expect("b submitted");
+
+        broker.cancel(2).expect("queued session is cancellable");
+        broker.cancel(1).expect("running session is cancellable");
+
+        // b never started: its first and only event is Cancelled.
+        assert_eq!(
+            events_b
+                .recv_timeout(Duration::from_secs(5))
+                .expect("b terminal event"),
+            SessionEvent::Cancelled
+        );
+        assert!(
+            events_b.recv_timeout(Duration::from_millis(200)).is_err(),
+            "b must not emit any further events"
+        );
+
+        // a terminates cancelled, whether the cancel landed mid-flight or
+        // before start; drain until the terminal event.
+        for _ in 0..4 {
+            let event = events_a
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a event");
+            if event == SessionEvent::Cancelled {
+                return;
+            }
+        }
+        panic!("a never reported cancellation");
     }
 }

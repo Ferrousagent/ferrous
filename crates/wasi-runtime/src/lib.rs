@@ -10,6 +10,7 @@ pub mod cancel;
 pub mod capability;
 pub mod command;
 pub mod native;
+pub mod pipe;
 pub mod policy;
 
 use std::sync::mpsc;
@@ -22,7 +23,8 @@ use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
 
 use crate::cancel::CancelHandle;
 use crate::capability::FilesystemAccess;
-use crate::command::{CommandError, CommandRequest, ExecutionMode};
+use crate::command::{CommandError, CommandRequest, ExecutionMode, SessionEvent, Stream};
+use crate::pipe::StreamOutputPipe;
 
 /// Errors produced while creating the runtime or admitting a component.
 #[derive(Debug, Error)]
@@ -123,12 +125,145 @@ impl WasiRuntime {
         self.run_wasi_inner(component, request, Some(cancel))
     }
 
-    fn run_wasi_inner(
+    /// Run one previously admitted WASI command while streaming live events.
+    ///
+    /// Emits [`SessionEvent::Output`] chunks to `events` as the guest produces
+    /// them, then returns the captured output and exit status. The output
+    /// budget is enforced structurally by the bounded pipes; cancellation and
+    /// the wall-clock timeout behave exactly as in
+    /// [`Self::run_wasi_cancellable`].
+    pub fn run_wasi_events(
         &self,
         component: &Component,
         request: &CommandRequest,
-        cancel: Option<&CancelHandle>,
+        cancel: &CancelHandle,
+        events: &mpsc::Sender<SessionEvent>,
     ) -> Result<WasiOutput, RuntimeError> {
+        self.run_wasi_events_impl(component, request, cancel, events, &|name| {
+            std::env::var(name).ok()
+        })
+    }
+
+    /// Shared streaming implementation with an injectable environment provider.
+    fn run_wasi_events_impl(
+        &self,
+        component: &Component,
+        request: &CommandRequest,
+        cancel: &CancelHandle,
+        events: &mpsc::Sender<SessionEvent>,
+        env_provider: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<WasiOutput, RuntimeError> {
+        let stdout = StreamOutputPipe::new(request.grant.limits().max_output_bytes());
+        let stderr = StreamOutputPipe::new(request.grant.limits().max_output_bytes());
+        let (mut store, linker) =
+            self.build_store(request, stdout.clone(), stderr.clone(), env_provider)?;
+        let epoch_ticks = request
+            .grant
+            .limits()
+            .timeout_seconds()
+            .saturating_mul(10)
+            .max(1);
+
+        // A reader thread drains both pipes while this thread runs the guest.
+        // It also serves as the epoch watchdog: cancellation bursts past the
+        // deadline, and a tick every ~100ms enforces the wall-clock timeout.
+        let engine = self.engine.clone();
+        let reader_cancel = cancel.clone();
+        let events_tx = events.clone();
+        let reader_stdout = stdout.clone();
+        let reader_stderr = stderr.clone();
+        let reader = std::thread::spawn(move || {
+            let mut last_tick = std::time::Instant::now();
+            let mut total_stdout = Vec::new();
+            let mut total_stderr = Vec::new();
+            loop {
+                let (out_bytes, out_eof) = reader_stdout.wait_and_drain(Duration::from_millis(50));
+                if !out_bytes.is_empty() {
+                    total_stdout.extend_from_slice(&out_bytes);
+                    let _ = events_tx.send(SessionEvent::Output {
+                        stream: Stream::Stdout,
+                        bytes: out_bytes,
+                    });
+                }
+                let (err_bytes, err_eof) = reader_stderr.wait_and_drain(Duration::from_millis(50));
+                if !err_bytes.is_empty() {
+                    total_stderr.extend_from_slice(&err_bytes);
+                    let _ = events_tx.send(SessionEvent::Output {
+                        stream: Stream::Stderr,
+                        bytes: err_bytes,
+                    });
+                }
+                if reader_cancel.is_cancelled() {
+                    // Burst past the deadline so the guest traps at its next
+                    // epoch check instead of waiting out the wall-clock timeout.
+                    for _ in 0..epoch_ticks {
+                        engine.increment_epoch();
+                    }
+                } else if last_tick.elapsed() >= Duration::from_millis(100) {
+                    engine.increment_epoch();
+                    last_tick = std::time::Instant::now();
+                }
+                if out_eof && err_eof {
+                    break;
+                }
+            }
+            (total_stdout, total_stderr)
+        });
+
+        let command = match wasmtime_wasi::p2::bindings::sync::Command::instantiate(
+            &mut store, component, &linker,
+        ) {
+            Ok(command) => command,
+            Err(error) => {
+                // Release the reader even when the guest never started.
+                drop(store);
+                stdout.set_eof();
+                stderr.set_eof();
+                let _ = reader.join();
+                return Err(RuntimeError::Wasi(error));
+            }
+        };
+        let run_result = command.wasi_cli_run().call_run(&mut store);
+        // The store owned the only writers; dropping it closes both pipes.
+        drop(store);
+        stdout.set_eof();
+        stderr.set_eof();
+        let (stdout_bytes, stderr_bytes) = reader
+            .join()
+            .map_err(|_| RuntimeError::Wasi(wasmtime::Error::msg("output reader thread failed")))?;
+
+        match run_result {
+            Ok(Ok(())) => Ok(WasiOutput {
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
+                exit_code: 0,
+            }),
+            Ok(Err(())) => Ok(WasiOutput {
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
+                exit_code: 1,
+            }),
+            Err(error) => {
+                if cancel.is_cancelled() {
+                    Err(RuntimeError::Cancelled)
+                } else {
+                    Err(RuntimeError::Wasi(error))
+                }
+            }
+        }
+    }
+
+    /// Build a store and linker for one request with the given stdio sinks.
+    ///
+    /// Shared by the capturing and streaming paths so both get exactly the
+    /// same capability, environment, and network posture.
+    fn build_store(
+        &self,
+        request: &CommandRequest,
+        stdout: impl wasmtime_wasi::cli::StdoutStream + 'static,
+        stderr: impl wasmtime_wasi::cli::StdoutStream + 'static,
+        env_provider: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(wasmtime::Store<StoreState>, Linker<StoreState>), RuntimeError> {
         request.validate()?;
         if request.mode != ExecutionMode::Wasi {
             return Err(RuntimeError::WrongMode);
@@ -139,23 +274,15 @@ impl WasiRuntime {
             )));
         }
 
-        let stdout = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(
-            request.grant.limits().max_output_bytes(),
-        );
-        let stderr = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(
-            request.grant.limits().max_output_bytes(),
-        );
         let mut builder = WasiCtx::builder();
         builder.args(&request.args);
         builder.initial_cwd("/workspace");
-        builder.stdout(stdout.clone());
-        builder.stderr(stderr.clone());
+        builder.stdout(stdout);
+        builder.stderr(stderr);
 
         // Environment: only allowlisted names propagate from the host process.
         // The allowlist is the policy; a name that is not granted is never read.
-        for (name, value) in
-            policy::selected_environment(&request.grant, &|name| std::env::var(name).ok())
-        {
+        for (name, value) in policy::selected_environment(&request.grant, env_provider) {
             builder.env(name, value);
         }
         // Networking: explicit default-deny. Without this, wasmtime's socket
@@ -224,6 +351,31 @@ impl WasiRuntime {
             .saturating_mul(10)
             .max(1);
         store.set_epoch_deadline(epoch_ticks);
+        Ok((store, linker))
+    }
+
+    fn run_wasi_inner(
+        &self,
+        component: &Component,
+        request: &CommandRequest,
+        cancel: Option<&CancelHandle>,
+    ) -> Result<WasiOutput, RuntimeError> {
+        let stdout = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(
+            request.grant.limits().max_output_bytes(),
+        );
+        let stderr = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(
+            request.grant.limits().max_output_bytes(),
+        );
+        let (mut store, linker) =
+            self.build_store(request, stdout.clone(), stderr.clone(), &|name| {
+                std::env::var(name).ok()
+            })?;
+        let epoch_ticks = request
+            .grant
+            .limits()
+            .timeout_seconds()
+            .saturating_mul(10)
+            .max(1);
 
         let command =
             wasmtime_wasi::p2::bindings::sync::Command::instantiate(&mut store, component, &linker)
