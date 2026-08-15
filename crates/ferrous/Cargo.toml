@@ -16,8 +16,8 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-shared = { path = "../shared" }
-wasi-runtime = { path = "../wasi-runtime" }
+shared = { path = "../shared", version = "0.1.0" }
+wasi-runtime = { path = "../wasi-runtime", version = "0.1.0" }
 
 [dev-dependencies]
 assert_cmd = "2"
