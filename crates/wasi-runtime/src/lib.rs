@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod broker;
+pub mod cancel;
 pub mod capability;
 pub mod command;
 pub mod native;
@@ -17,6 +19,7 @@ use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
 
+use crate::cancel::CancelHandle;
 use crate::capability::FilesystemAccess;
 use crate::command::{CommandError, CommandRequest, ExecutionMode};
 
@@ -38,6 +41,9 @@ pub enum RuntimeError {
     /// A non-WASI request was passed to the WASI backend.
     #[error("WASI backend received a non-WASI request")]
     WrongMode,
+    /// The session was cancelled before the guest completed.
+    #[error("session was cancelled")]
+    Cancelled,
 }
 
 /// Captured output and exit status from one WASI command.
@@ -72,6 +78,11 @@ pub struct WasiRuntime {
 }
 
 impl WasiRuntime {
+    /// Return the engine this runtime compiles and runs components on.
+    pub fn engine(&self) -> &wasmtime::Engine {
+        &self.engine
+    }
+
     /// Create the production Phase 1 engine configuration.
     pub fn new() -> Result<Self, RuntimeError> {
         let mut config = wasmtime::Config::new();
@@ -93,6 +104,29 @@ impl WasiRuntime {
         &self,
         component: &Component,
         request: &CommandRequest,
+    ) -> Result<WasiOutput, RuntimeError> {
+        self.run_wasi_inner(component, request, None)
+    }
+
+    /// Run one previously admitted WASI command with cancellation support.
+    ///
+    /// Once the handle is cancelled the guest is interrupted at its next epoch
+    /// check and [`RuntimeError::Cancelled`] is returned. A finished or never
+    /// started run is unaffected.
+    pub fn run_wasi_cancellable(
+        &self,
+        component: &Component,
+        request: &CommandRequest,
+        cancel: &CancelHandle,
+    ) -> Result<WasiOutput, RuntimeError> {
+        self.run_wasi_inner(component, request, Some(cancel))
+    }
+
+    fn run_wasi_inner(
+        &self,
+        component: &Component,
+        request: &CommandRequest,
+        cancel: Option<&CancelHandle>,
     ) -> Result<WasiOutput, RuntimeError> {
         request.validate()?;
         if request.mode != ExecutionMode::Wasi {
@@ -163,7 +197,9 @@ impl WasiRuntime {
             },
         );
         store.limiter(|state| &mut state.limits);
-        store.set_fuel(1_000_000).map_err(RuntimeError::Wasi)?;
+        store
+            .set_fuel(request.grant.limits().max_fuel())
+            .map_err(RuntimeError::Wasi)?;
         let epoch_ticks = request
             .grant
             .limits()
@@ -177,30 +213,55 @@ impl WasiRuntime {
                 .map_err(RuntimeError::Wasi)?;
         let (stop_sender, stop_receiver) = mpsc::channel();
         let engine = self.engine.clone();
+        let cancel = cancel.cloned();
+        let watchdog_cancel = cancel.clone();
         let watchdog = std::thread::spawn(move || {
-            for _ in 0..epoch_ticks {
+            let mut ticks = 0u64;
+            loop {
+                if let Some(cancel) = &watchdog_cancel {
+                    if cancel.is_cancelled() {
+                        // Burst past the guest's deadline so it traps at its next
+                        // epoch check instead of waiting out the wall-clock timeout.
+                        for _ in 0..epoch_ticks {
+                            engine.increment_epoch();
+                        }
+                        return;
+                    }
+                }
+                if ticks >= epoch_ticks {
+                    return;
+                }
                 match stop_receiver.recv_timeout(Duration::from_millis(100)) {
                     Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                    Err(mpsc::RecvTimeoutError::Timeout) => engine.increment_epoch(),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        engine.increment_epoch();
+                        ticks += 1;
+                    }
                 }
             }
         });
-        let run_result = command
-            .wasi_cli_run()
-            .call_run(&mut store)
-            .map_err(RuntimeError::Wasi);
+        let run_result = command.wasi_cli_run().call_run(&mut store);
         let _ = stop_sender.send(());
         let _ = watchdog.join();
-        let exit = match run_result? {
-            Ok(()) => 0,
-            Err(()) => 1,
-        };
-
-        Ok(WasiOutput {
-            stdout: stdout.contents().to_vec(),
-            stderr: stderr.contents().to_vec(),
-            exit_code: exit,
-        })
+        match run_result {
+            Ok(Ok(())) => Ok(WasiOutput {
+                stdout: stdout.contents().to_vec(),
+                stderr: stderr.contents().to_vec(),
+                exit_code: 0,
+            }),
+            Ok(Err(())) => Ok(WasiOutput {
+                stdout: stdout.contents().to_vec(),
+                stderr: stderr.contents().to_vec(),
+                exit_code: 1,
+            }),
+            Err(error) => {
+                if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+                    Err(RuntimeError::Cancelled)
+                } else {
+                    Err(RuntimeError::Wasi(error))
+                }
+            }
+        }
     }
 }
 

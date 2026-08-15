@@ -84,12 +84,14 @@ pub struct ResourceLimits {
     max_output_bytes: usize,
     timeout_seconds: u64,
     max_memory_bytes: usize,
+    max_fuel: u64,
 }
 
 const DEFAULT_LIMITS: ResourceLimits = ResourceLimits {
     max_output_bytes: 1_048_576,
     timeout_seconds: 30,
     max_memory_bytes: 64 * 1024 * 1024,
+    max_fuel: 1_000_000,
 };
 
 impl ResourceLimits {
@@ -112,7 +114,17 @@ impl ResourceLimits {
             max_output_bytes,
             timeout_seconds,
             max_memory_bytes: DEFAULT_LIMITS.max_memory_bytes,
+            max_fuel: DEFAULT_LIMITS.max_fuel,
         })
+    }
+
+    /// Set the maximum guest fuel (instructions) before the runtime traps it.
+    pub const fn with_fuel(mut self, max_fuel: u64) -> Result<Self, CapabilityError> {
+        if max_fuel == 0 {
+            return Err(CapabilityError::InvalidLimit { name: "max_fuel" });
+        }
+        self.max_fuel = max_fuel;
+        Ok(self)
     }
 
     /// Set the maximum size of each guest linear memory.
@@ -137,6 +149,11 @@ impl ResourceLimits {
     /// Maximum wall-clock duration in seconds.
     pub const fn timeout_seconds(self) -> u64 {
         self.timeout_seconds
+    }
+
+    /// Maximum guest fuel (instructions) before the runtime traps it.
+    pub const fn max_fuel(self) -> u64 {
+        self.max_fuel
     }
 
     /// Maximum size of each guest linear memory.
@@ -312,6 +329,14 @@ mod tests {
             FilesystemGrant::new("/workspace/../secrets", FilesystemAccess::Read),
             Err(CapabilityError::InvalidPath(_))
         ));
+    }
+
+    #[test]
+    fn rejects_zero_fuel_and_zero_memory_limits() {
+        let limits = ResourceLimits::new(1024, 30).expect("valid limits");
+        assert!(limits.with_fuel(0).is_err());
+        assert!(limits.with_memory_bytes(0).is_err());
+        assert_eq!(limits.max_fuel(), 1_000_000);
     }
 
     #[test]
