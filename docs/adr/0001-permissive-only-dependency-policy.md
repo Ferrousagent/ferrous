@@ -12,9 +12,14 @@ the Instackable canvas — may be copyleft, so the policy directly affects compo
 
 ## Decision
 
-- Only permissive licenses are allowed: `MIT`, `Apache-2.0`, `BSD-2-Clause`,
-  `BSD-3-Clause`, `ISC`, `Zlib`, `0BSD`, `Unlicense`, `MIT-0`, `Unicode-3.0`,
-  `Unicode-DFS-2016`.
+- Only permissive licenses are allowed: `MIT`, `Apache-2.0`,
+  `Apache-2.0 WITH LLVM-exception`, `BSD-2-Clause`, `BSD-3-Clause`, `ISC`,
+  `Zlib`, `0BSD`, `Unlicense`, `MIT-0`, `Unicode-3.0`, `Unicode-DFS-2016`.
+- `Apache-2.0 WITH LLVM-exception` was added with the Phase 1 WASI runtime:
+  Wasmtime and Cranelift are `Apache-2.0 WITH LLVM-exception`, which cargo-deny
+  treats as a distinct SPDX expression from plain `Apache-2.0`. The exception
+  clause covers LLVM-derived code and does not introduce copyleft obligations,
+  so the permissive policy is unchanged in spirit.
 - Copyleft and weak-copyleft licenses are denied project-wide.
 - The policy is enforced mechanically by `cargo-deny` in CI (`deny.toml`).
 - Any per-crate exception requires a new ADR.
