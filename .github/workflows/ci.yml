@@ -2,11 +2,25 @@ name: CI
 
 on:
   push:
+    # Skip the full matrix when only docs/planning files change; code still
+    # gets full coverage on every real change.
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
   # Nightly advisory sweep: RustSec advisories are published after our last push.
   schedule:
     - cron: '0 0 * * *'
   workflow_dispatch:
+
+# Kill stale runs when a newer push lands on the same branch; a superseded
+# run burning minutes to completion is pure waste.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
