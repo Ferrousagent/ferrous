@@ -565,7 +565,21 @@ fn worker_loop(runtime: WasiRuntime, queue_rx: mpsc::Receiver<Job>, state: Arc<B
             }
             Risk::RequiresApproval(reason) => {
                 let _ = job.session.accept(SessionEvent::PendingApproval { reason });
-                let notified = match &job.sink {
+                // Park before notifying: the moment the caller observes the
+                // notification, approve/deny/cancel must find the session.
+                // Clone the sink sender first so we can notify after parking.
+                let notify_sink = match &job.sink {
+                    JobSink::Outcome(result_tx) => JobSink::Outcome(result_tx.clone()),
+                    JobSink::Events(event_tx) => JobSink::Events(event_tx.clone()),
+                };
+                let deadline = Instant::now() + state.approval_timeout();
+                let id = job.request.id;
+                state
+                    .pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(id, PendingJob { job, deadline });
+                let notified = match &notify_sink {
                     JobSink::Outcome(result_tx) => result_tx
                         .send(BrokerOutcome::PendingApproval { reason })
                         .is_ok(),
@@ -574,20 +588,19 @@ fn worker_loop(runtime: WasiRuntime, queue_rx: mpsc::Receiver<Job>, state: Arc<B
                         .is_ok(),
                 };
                 if !notified {
-                    // The caller is gone; do not park a session nobody can decide on.
+                    // The caller is gone (or already cancelled the parked
+                    // session); do not leave a session nobody can decide on.
+                    state
+                        .pending
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&id);
                     state
                         .handles
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
-                        .remove(&job.request.id);
-                    continue;
+                        .remove(&id);
                 }
-                let deadline = Instant::now() + state.approval_timeout();
-                state
-                    .pending
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(job.request.id, PendingJob { job, deadline });
             }
         }
     }
