@@ -242,14 +242,14 @@ mod tests {
 
     #[test]
     fn read_only_command_is_auto_approved() {
-        let grant = CapabilityGrant::workspace(&std::env::temp_dir(), FilesystemAccess::Read)
+        let grant = CapabilityGrant::workspace(std::env::temp_dir(), FilesystemAccess::Read)
             .expect("absolute path");
         assert_eq!(classify_risk(&classified_request(grant)), Risk::AutoApprove);
     }
 
     #[test]
     fn filesystem_write_requires_approval() {
-        let grant = CapabilityGrant::workspace(&std::env::temp_dir(), FilesystemAccess::ReadWrite)
+        let grant = CapabilityGrant::workspace(std::env::temp_dir(), FilesystemAccess::ReadWrite)
             .expect("absolute path");
         assert_eq!(
             classify_risk(&classified_request(grant)),
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn network_access_requires_approval() {
-        let grant = CapabilityGrant::workspace(&std::env::temp_dir(), FilesystemAccess::Read)
+        let grant = CapabilityGrant::workspace(std::env::temp_dir(), FilesystemAccess::Read)
             .expect("absolute path")
             .allow_loopback_port(3000);
         assert_eq!(
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn environment_access_requires_approval() {
-        let grant = CapabilityGrant::workspace(&std::env::temp_dir(), FilesystemAccess::Read)
+        let grant = CapabilityGrant::workspace(std::env::temp_dir(), FilesystemAccess::Read)
             .expect("absolute path")
             .allow_environment("PATH")
             .expect("valid name");
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn native_execution_is_the_highest_risk() {
-        let grant = CapabilityGrant::workspace(&std::env::temp_dir(), FilesystemAccess::ReadWrite)
+        let grant = CapabilityGrant::workspace(std::env::temp_dir(), FilesystemAccess::ReadWrite)
             .expect("absolute path")
             .allow_native_execution();
         // Write + native: native wins the classification.
