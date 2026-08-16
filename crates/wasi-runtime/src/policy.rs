@@ -14,7 +14,8 @@ use std::net::SocketAddr;
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::sockets::SocketAddrUse;
 
-use crate::capability::CapabilityGrant;
+use crate::capability::{CapabilityGrant, FilesystemAccess};
+use crate::command::{ApprovalReason, CommandRequest, ExecutionMode};
 
 /// Network posture for one command, derived from the grant's port allowlist.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,6 +86,40 @@ pub fn selected_environment(
         .environment_names()
         .filter_map(|name| provider(name).map(|value| (name.to_owned(), value)))
         .collect()
+}
+
+/// How risky a request is under the default approval posture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Risk {
+    /// Low-risk: runs without human approval.
+    AutoApprove,
+    /// A human must approve the request before it may run.
+    RequiresApproval(ApprovalReason),
+}
+
+/// Classify a request under the default approval posture.
+///
+/// Anything beyond a purely read-only WASI command requires human approval:
+/// native execution, filesystem writes, loopback network access, and
+/// environment access all gate on a human. The first matching reason wins.
+pub fn classify_risk(request: &CommandRequest) -> Risk {
+    if request.mode == ExecutionMode::Native || request.grant.allows_native_execution() {
+        return Risk::RequiresApproval(ApprovalReason::NativeExecution);
+    }
+    if request
+        .grant
+        .filesystem_grants()
+        .any(|filesystem| filesystem.access() == FilesystemAccess::ReadWrite)
+    {
+        return Risk::RequiresApproval(ApprovalReason::FilesystemWrite);
+    }
+    if request.grant.loopback_ports().iter().next().is_some() {
+        return Risk::RequiresApproval(ApprovalReason::NetworkAccess);
+    }
+    if request.grant.environment_names().next().is_some() {
+        return Risk::RequiresApproval(ApprovalReason::EnvironmentAccess);
+    }
+    Risk::AutoApprove
 }
 
 #[cfg(test)]
@@ -190,5 +225,70 @@ mod tests {
         };
         let _ = selected_environment(&grant, &provider);
         assert!(queried.borrow().is_empty());
+    }
+
+    fn classified_request(grant: CapabilityGrant) -> crate::command::CommandRequest {
+        crate::command::CommandRequest::new(
+            1,
+            crate::command::Actor::Agent,
+            ExecutionMode::Wasi,
+            "tool",
+            std::iter::empty::<&str>(),
+            std::env::temp_dir(),
+            grant,
+        )
+        .expect("request is valid")
+    }
+
+    #[test]
+    fn read_only_command_is_auto_approved() {
+        let grant = CapabilityGrant::workspace(&std::env::temp_dir(), FilesystemAccess::Read)
+            .expect("absolute path");
+        assert_eq!(classify_risk(&classified_request(grant)), Risk::AutoApprove);
+    }
+
+    #[test]
+    fn filesystem_write_requires_approval() {
+        let grant = CapabilityGrant::workspace(&std::env::temp_dir(), FilesystemAccess::ReadWrite)
+            .expect("absolute path");
+        assert_eq!(
+            classify_risk(&classified_request(grant)),
+            Risk::RequiresApproval(ApprovalReason::FilesystemWrite)
+        );
+    }
+
+    #[test]
+    fn network_access_requires_approval() {
+        let grant = CapabilityGrant::workspace(&std::env::temp_dir(), FilesystemAccess::Read)
+            .expect("absolute path")
+            .allow_loopback_port(3000);
+        assert_eq!(
+            classify_risk(&classified_request(grant)),
+            Risk::RequiresApproval(ApprovalReason::NetworkAccess)
+        );
+    }
+
+    #[test]
+    fn environment_access_requires_approval() {
+        let grant = CapabilityGrant::workspace(&std::env::temp_dir(), FilesystemAccess::Read)
+            .expect("absolute path")
+            .allow_environment("PATH")
+            .expect("valid name");
+        assert_eq!(
+            classify_risk(&classified_request(grant)),
+            Risk::RequiresApproval(ApprovalReason::EnvironmentAccess)
+        );
+    }
+
+    #[test]
+    fn native_execution_is_the_highest_risk() {
+        let grant = CapabilityGrant::workspace(&std::env::temp_dir(), FilesystemAccess::ReadWrite)
+            .expect("absolute path")
+            .allow_native_execution();
+        // Write + native: native wins the classification.
+        assert_eq!(
+            classify_risk(&classified_request(grant)),
+            Risk::RequiresApproval(ApprovalReason::NativeExecution)
+        );
     }
 }

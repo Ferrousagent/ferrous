@@ -100,7 +100,7 @@ fn contains_nul(value: &str) -> bool {
 }
 
 /// Errors that prevent a command from starting.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum CommandError {
     /// The executable name was empty or contained a NUL byte.
     #[error("invalid program")]
@@ -122,6 +122,19 @@ pub enum CommandError {
     OutputLimit,
 }
 
+/// Why a session needs human approval before it can start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalReason {
+    /// The command may write below a granted filesystem root.
+    FilesystemWrite,
+    /// The command may open loopback TCP sockets.
+    NetworkAccess,
+    /// The command reads environment variables.
+    EnvironmentAccess,
+    /// The command requested native process execution.
+    NativeExecution,
+}
+
 /// Which output stream produced a chunk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stream {
@@ -136,6 +149,11 @@ pub enum Stream {
 pub enum SessionEvent {
     /// Backend accepted and started the request.
     Started,
+    /// The session is parked waiting for a human approval decision.
+    PendingApproval {
+        /// Why this session needs approval.
+        reason: ApprovalReason,
+    },
     /// A bounded output chunk.
     Output {
         /// Output stream.
@@ -159,6 +177,7 @@ pub enum SessionEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Lifecycle {
     Created,
+    WaitingApproval,
     Running,
     Finished,
 }
@@ -200,6 +219,18 @@ impl SessionState {
                 self.lifecycle = Lifecycle::Running;
                 Ok(())
             }
+            (Lifecycle::Created, SessionEvent::PendingApproval { .. }) => {
+                self.lifecycle = Lifecycle::WaitingApproval;
+                Ok(())
+            }
+            (Lifecycle::WaitingApproval, SessionEvent::Started) => {
+                self.lifecycle = Lifecycle::Running;
+                Ok(())
+            }
+            (Lifecycle::WaitingApproval, SessionEvent::Denied | SessionEvent::Unsupported) => {
+                self.lifecycle = Lifecycle::Finished;
+                Ok(())
+            }
             (Lifecycle::Running, SessionEvent::Output { bytes, .. }) => {
                 let next = self
                     .output_bytes
@@ -222,9 +253,15 @@ impl SessionState {
             (Lifecycle::Created, _) => {
                 Err(CommandError::InvalidTransition("session has not started"))
             }
+            (Lifecycle::WaitingApproval, _) => Err(CommandError::InvalidTransition(
+                "session is awaiting approval",
+            )),
             (Lifecycle::Running, SessionEvent::Started) => {
                 Err(CommandError::InvalidTransition("session already started"))
             }
+            (Lifecycle::Running, SessionEvent::PendingApproval { .. }) => Err(
+                CommandError::InvalidTransition("running session cannot await approval"),
+            ),
             (Lifecycle::Running, SessionEvent::Denied | SessionEvent::Unsupported) => Err(
                 CommandError::InvalidTransition("running session cannot be denied"),
             ),
