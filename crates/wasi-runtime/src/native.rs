@@ -63,7 +63,7 @@ pub struct NativeOutput {
     /// Captured standard error (empty for PTY sessions).
     pub stderr: Vec<u8>,
     /// Process exit code.
-    pub exit_code: i32,
+    pub exit_code: u32,
 }
 
 /// A running PTY session: master (resize/reader), writer (input), and child.
@@ -103,7 +103,7 @@ impl NativeSession {
     }
 
     /// Poll whether the child has exited, returning its exit code.
-    pub fn try_exit_status(&mut self) -> Result<Option<i32>, NativeError> {
+    pub fn try_exit_status(&mut self) -> Result<Option<u32>, NativeError> {
         match self.child.try_wait()? {
             Some(status) => Ok(Some(status.exit_code())),
             None => Ok(None),
