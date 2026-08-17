@@ -213,6 +213,9 @@ impl NativeBackend {
 ///
 /// Kept as a free function so the session driver's reader thread has a
 /// testable pure helper; `emit` forwards chunks to `SessionEvent::Output`.
+/// Consumed by the native session driver (next task); currently exercised
+/// by unit tests only.
+#[expect(dead_code)]
 pub(crate) fn drain_reader(
     mut reader: Box<dyn Read + Send>,
     emit: &mut dyn FnMut(&[u8]),
@@ -356,7 +359,7 @@ mod tests {
         // be created. With direct argv, `echo` prints the string literally.
         let arg = format!("$(touch {})", marker.display());
         let request = native_request("echo", &[&arg], grant.clone());
-        let mut session = NativeBackend::new().spawn(&request).expect("spawns");
+        let session = NativeBackend::new().spawn(&request).expect("spawns");
 
         let mut output = Vec::new();
         let mut reader = session.try_clone_reader().expect("reader");
