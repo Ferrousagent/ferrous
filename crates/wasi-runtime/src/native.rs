@@ -156,6 +156,20 @@ impl NativeBackend {
     /// not granted, the request is invalid, the host adapter is unsupported,
     /// or the working directory does not resolve inside the grant.
     pub fn spawn(&self, request: &CommandRequest) -> Result<NativeSession, NativeError> {
+        self.spawn_with_env(request, &|name| std::env::var(name).ok())
+    }
+
+    /// [`Self::spawn`] with an injectable environment provider.
+    ///
+    /// The provider resolves host environment values; only grant-allowlisted
+    /// names are ever queried and forwarded to the child. Injection keeps the
+    /// allowlist filtering testable without mutating the test process
+    /// environment (unsafe in edition 2024).
+    pub fn spawn_with_env(
+        &self,
+        request: &CommandRequest,
+        env_provider: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<NativeSession, NativeError> {
         if request.mode != ExecutionMode::Native {
             return Err(NativeError::WrongMode);
         }
@@ -187,8 +201,7 @@ impl NativeBackend {
             builder.arg(argument);
         }
         // Only grant-allowlisted environment variables reach the child.
-        for (name, value) in selected_environment(&request.grant, &|name| std::env::var(name).ok())
-        {
+        for (name, value) in selected_environment(&request.grant, env_provider) {
             builder.env(name, value);
         }
 
@@ -301,12 +314,20 @@ mod tests {
     fn spawn_requires_explicit_grant() {
         let root = test_root("no-native");
         let _ = std::fs::create_dir_all(&root);
+        // Build the request directly: with a grant that lacks native
+        // execution, request validation already fails closed.
         let grant = CapabilityGrant::workspace(&root, FilesystemAccess::Read).expect("absolute");
-        let request = native_request("echo", &["hi"], grant);
-        assert!(matches!(
-            NativeBackend::new().spawn(&request),
-            Err(NativeError::NativeNotGranted)
-        ));
+        let request = CommandRequest::new(
+            1,
+            crate::command::Actor::Agent,
+            ExecutionMode::Native,
+            "echo",
+            ["hi"],
+            &root,
+            grant,
+        )
+        .expect_err("native without a grant must be denied at request construction");
+        assert!(request.to_string().contains("native execution"));
     }
 
     #[cfg(unix)]
@@ -401,15 +422,17 @@ mod tests {
         let grant = workspace_grant()
             .allow_environment("ALLOWED_VAR")
             .expect("valid name");
-        // The host test process must not mutate its own environment (unsafe in
-        // edition 2024); instead the backend's env plumbing is exercised by the
-        // session driver tests, which inject vars via the CommandBuilder. Here
-        // we only prove the allowlist filtering is applied to the *grant*.
-        assert!(grant.allows_environment("ALLOWED_VAR"));
-        assert!(!grant.allows_environment("LEAKY_VAR"));
-
         let request = native_request("env", &[], grant);
-        let session = NativeBackend::new().spawn(&request).expect("spawns");
+        // The provider simulates a host environment: ALLOWED_VAR is granted,
+        // LEAKY_VAR is present on the "host" but NOT in the grant.
+        let provider = |name: &str| match name {
+            "ALLOWED_VAR" => Some("allowed-value".to_owned()),
+            "LEAKY_VAR" => Some("leaky-value".to_owned()),
+            _ => None,
+        };
+        let session = NativeBackend::new()
+            .spawn_with_env(&request, &provider)
+            .expect("spawns");
         let mut output = Vec::new();
         let mut reader = session.try_clone_reader().expect("reader");
         let mut buffer = [0u8; 4096];
