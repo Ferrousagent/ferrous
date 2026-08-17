@@ -10,6 +10,7 @@ pub mod cancel;
 pub mod capability;
 pub mod command;
 pub mod native;
+pub mod native_session;
 pub mod pipe;
 pub mod policy;
 

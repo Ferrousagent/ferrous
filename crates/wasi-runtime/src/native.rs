@@ -71,16 +71,26 @@ pub struct NativeOutput {
 /// Owned by the session driver; the broker never touches the raw handles.
 pub struct NativeSession {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    writer: Option<Box<dyn Write + Send>>,
     child: Box<dyn Child + Send + Sync>,
 }
 
 impl NativeSession {
     /// Write raw bytes (keystrokes) to the PTY master.
     pub fn write_input(&mut self, bytes: &[u8]) -> Result<(), NativeError> {
-        self.writer.write_all(bytes)?;
-        self.writer.flush()?;
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| NativeError::SpawnFailed("PTY writer was already taken".into()))?;
+        writer.write_all(bytes)?;
+        writer.flush()?;
         Ok(())
+    }
+
+    /// Take the writer out of the session, handing it to the input thread.
+    /// Returns `None` if it was already taken.
+    pub fn take_writer(&mut self) -> Option<Box<dyn Write + Send>> {
+        self.writer.take()
     }
 
     /// Resize the PTY viewport.
@@ -113,6 +123,13 @@ impl NativeSession {
     /// Clone of the child killer for the watchdog/cancel thread.
     pub fn child_killer(&mut self) -> Box<dyn ChildKiller + Send + Sync> {
         self.child.clone_killer()
+    }
+
+    /// Kill the child (and, on Unix, its whole process group). No-op if the
+    /// child already exited.
+    pub fn kill(&mut self) -> Result<(), NativeError> {
+        self.child.kill()?;
+        Ok(())
     }
 
     /// The child's process id, when the platform exposes one.
@@ -216,7 +233,7 @@ impl NativeBackend {
 
         Ok(NativeSession {
             master: pair.master,
-            writer,
+            writer: Some(writer),
             child,
         })
     }
@@ -226,8 +243,6 @@ impl NativeBackend {
 ///
 /// Kept as a free function so the session driver's reader thread has a
 /// testable pure helper; `emit` forwards chunks to `SessionEvent::Output`.
-/// Test-only until the session driver (next task) consumes it.
-#[cfg(test)]
 pub(crate) fn drain_reader(
     mut reader: Box<dyn Read + Send>,
     emit: &mut dyn FnMut(&[u8]),
