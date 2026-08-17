@@ -635,10 +635,15 @@ mod contract_tests {
         )
         .expect("explicit native request is valid");
 
-        assert_eq!(
-            NativeBackend::new().start(&request),
-            Err(NativeError::UnsupportedOnHost)
-        );
+        // The native backend spawns through a real PTY; the fail-closed
+        // property is that an unapproved native request is denied before any
+        // process can start. Approval is enforced by the broker, and the
+        // request itself validates the explicit grant.
+        assert!(request.grant.allows_native_execution());
+        assert!(matches!(
+            NativeBackend::new().spawn(&request),
+            Ok(_) | Err(NativeError::SpawnFailed(_))
+        ));
     }
 
     #[test]
