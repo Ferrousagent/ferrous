@@ -102,7 +102,7 @@ impl NativeSessionHandle {
         // Watchdog: enforce cancellation + wall-clock deadline by killing the
         // child and recording WHY it was killed.
         let watchdog_cancel = self.cancel.clone();
-        let watchdog_killer = killer.clone_killer();
+        let mut watchdog_killer = killer.clone_killer();
         let watchdog = std::thread::spawn(move || {
             loop {
                 if watchdog_stop.load(Ordering::SeqCst) {
