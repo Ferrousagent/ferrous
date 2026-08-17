@@ -162,7 +162,10 @@ impl NativeSessionHandle {
         // Input: forward keystrokes from the broker channel into the PTY.
         let input_rx = self.input_rx;
         let input = std::thread::spawn(move || {
-            let mut writer = writer;
+            let mut writer = match writer {
+                Some(writer) => writer,
+                None => return,
+            };
             while let Ok(bytes) = input_rx.recv() {
                 let _ = writer.write_all(&bytes);
                 let _ = writer.flush();
