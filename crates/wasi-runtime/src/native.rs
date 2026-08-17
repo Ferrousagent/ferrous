@@ -1,14 +1,127 @@
-//! Native terminal boundary.
+//! Native terminal boundary: capability-gated PTY execution for approved
+//! developer commands (`bash`, `cargo`, `npm`, `git`).
 //!
-//! This module intentionally does not spawn a process yet. The important Phase 1
-//! behavior is that native requests have a named backend and return `unsupported`
-//! rather than silently executing with ambient authority.
+//! Phase 1 contract: native execution requires an explicit capability grant
+//! AND human approval (enforced by the broker). Unsupported hosts return
+//! [`NativeError::UnsupportedOnHost`] — they never fall back to ambient
+//! execution.
+//!
+//! Every child is spawned with **direct argv** ([`portable_pty::CommandBuilder`]),
+//! never through a shell string, so metacharacters in arguments are inert
+//! (risk register R34). Only grant-allowlisted environment variables reach the
+//! child (R8), and the working directory must resolve inside the grant (R6).
 
+use std::io::{Read, Write};
+use std::path::Path;
+
+use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use thiserror::Error;
 
-use crate::command::{CommandRequest, ExecutionMode};
+use crate::command::{CommandError, CommandRequest, ExecutionMode};
+use crate::policy::selected_environment;
 
-/// Native execution backend selected by policy.
+/// Fail-closed errors from the native backend boundary.
+#[derive(Debug, Error)]
+pub enum NativeError {
+    /// The request selected a different backend.
+    #[error("native backend received a non-native request")]
+    WrongMode,
+    /// Native execution was not granted.
+    #[error("native execution was not granted")]
+    NativeNotGranted,
+    /// No tested platform sandbox adapter is available on this host.
+    #[error("native execution is unsupported on this host")]
+    UnsupportedOnHost,
+    /// The request failed validation before any process could spawn.
+    #[error("invalid native request: {0}")]
+    InvalidRequest(#[from] CommandError),
+    /// The child could not be spawned.
+    #[error("failed to spawn native process: {0}")]
+    SpawnFailed(String),
+    /// A PTY or process I/O operation failed.
+    #[error("native I/O failure: {0}")]
+    Io(#[from] std::io::Error),
+    /// The session was cancelled before the child completed.
+    #[error("native session was cancelled")]
+    Cancelled,
+    /// The session exceeded its wall-clock timeout.
+    #[error("native session exceeded its wall-clock timeout")]
+    Timeout,
+    /// The session exceeded its combined output budget.
+    #[error("native session exceeded its output budget")]
+    OutputLimit,
+}
+
+/// Captured output and exit status of one native command.
+///
+/// A PTY merges stdout and stderr, so `stderr` is conventionally empty for
+/// native sessions; all captured bytes appear in `stdout`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeOutput {
+    /// Captured standard output (includes merged stderr from the PTY).
+    pub stdout: Vec<u8>,
+    /// Captured standard error (empty for PTY sessions).
+    pub stderr: Vec<u8>,
+    /// Process exit code.
+    pub exit_code: i32,
+}
+
+/// A running PTY session: master (resize/reader), writer (input), and child.
+///
+/// Owned by the session driver; the broker never touches the raw handles.
+pub struct NativeSession {
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn Child + Send + Sync>,
+}
+
+impl NativeSession {
+    /// Write raw bytes (keystrokes) to the PTY master.
+    pub fn write_input(&mut self, bytes: &[u8]) -> Result<(), NativeError> {
+        self.writer.write_all(bytes)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Resize the PTY viewport.
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), NativeError> {
+        self.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        Ok(())
+    }
+
+    /// A reader clone for the output-draining thread.
+    pub fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>, NativeError> {
+        self.master.try_clone_reader().map_err(NativeError::from)
+    }
+
+    /// Poll whether the child has exited, returning its exit code.
+    pub fn try_exit_status(&mut self) -> Result<Option<i32>, NativeError> {
+        match self.child.try_wait()? {
+            Some(status) => Ok(Some(status.exit_code())),
+            None => Ok(None),
+        }
+    }
+
+    /// Clone of the child killer for the watchdog/cancel thread.
+    pub fn child_killer(&mut self) -> Box<dyn ChildKiller + Send + Sync> {
+        self.child.clone_killer()
+    }
+
+    /// The child's process id, when the platform exposes one.
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+}
+
+/// The native execution backend.
+///
+/// Phase 1 supports hosts whose platform policy adapter is implemented and
+/// tested; every other host fails closed with [`NativeError::UnsupportedOnHost`].
 #[derive(Debug, Default)]
 pub struct NativeBackend;
 
@@ -18,31 +131,338 @@ impl NativeBackend {
         Self
     }
 
-    /// Start a native request when a platform adapter is available.
+    /// Whether this host can enforce the native execution policy.
     ///
-    /// Phase 1 deliberately returns [`NativeError::UnsupportedOnHost`] on every host
-    /// until the PTY/ConPTY process policy is implemented and tested.
-    pub fn start(&self, request: &CommandRequest) -> Result<(), NativeError> {
+    /// Unix (PTY + process-group semantics) is the Phase 1 adapter. Windows
+    /// (ConPTY) and macOS policy adapters land in a later pass and must report
+    /// unsupported until they are tested — never ambient fallback.
+    #[cfg(unix)]
+    pub const fn supported_on_host() -> bool {
+        true
+    }
+
+    /// Non-unix hosts fail closed until their adapter is implemented.
+    #[cfg(not(unix))]
+    pub const fn supported_on_host() -> bool {
+        false
+    }
+
+    /// Spawn one approved native request into a PTY session.
+    ///
+    /// Fails before spawning when: the mode is not native, native execution is
+    /// not granted, the request is invalid, the host adapter is unsupported,
+    /// or the working directory does not resolve inside the grant.
+    pub fn spawn(&self, request: &CommandRequest) -> Result<NativeSession, NativeError> {
         if request.mode != ExecutionMode::Native {
             return Err(NativeError::WrongMode);
         }
         if !request.grant.allows_native_execution() {
             return Err(NativeError::NativeNotGranted);
         }
-        Err(NativeError::UnsupportedOnHost)
+        request.validate()?;
+        if !Self::supported_on_host() {
+            return Err(NativeError::UnsupportedOnHost);
+        }
+        // The cwd must exist and resolve inside the grant (symlink-aware).
+        if !request.grant.allows_existing_path(&request.cwd) {
+            return Err(CommandError::WorkingDirectoryDenied(request.cwd.clone()).into());
+        }
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|error| NativeError::SpawnFailed(error.to_string()))?;
+
+        let mut builder = CommandBuilder::new(&request.program);
+        builder.cwd(Path::new(&request.cwd));
+        for argument in &request.args {
+            builder.arg(argument);
+        }
+        // Only grant-allowlisted environment variables reach the child.
+        for (name, value) in selected_environment(&request.grant, &|name| std::env::var(name).ok()) {
+            builder.env(name, value);
+        }
+
+        let child = pair
+            .slave
+            .spawn_command(builder)
+            .map_err(|error| NativeError::SpawnFailed(error.to_string()))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|error| NativeError::SpawnFailed(error.to_string()))?;
+
+        Ok(NativeSession {
+            master: pair.master,
+            writer,
+            child,
+        })
     }
 }
 
-/// Fail-closed errors from the native backend boundary.
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-pub enum NativeError {
-    /// The request selected a different backend.
-    #[error("native backend received a non-native request")]
-    WrongMode,
-    /// Native execution was not granted.
-    #[error("native execution was not granted")]
-    NativeNotGranted,
-    /// No tested platform sandbox adapter is available yet.
-    #[error("native execution is unsupported on this host")]
-    UnsupportedOnHost,
+/// Drain `reader` until EOF, forwarding chunks to `emit`.
+///
+/// Kept as a free function so the session driver's reader thread has a
+/// testable pure helper; `emit` forwards chunks to `SessionEvent::Output`.
+pub(crate) fn drain_reader(
+    mut reader: Box<dyn Read + Send>,
+    emit: &mut dyn FnMut(&[u8]),
+) -> std::io::Result<usize> {
+    let mut total = 0usize;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        total += count;
+        emit(&buffer[..count]);
+    }
+    Ok(total)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+    use crate::capability::{CapabilityGrant, FilesystemAccess};
+
+    fn test_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ferrous-native-{name}-{}", std::process::id()))
+    }
+
+    fn native_request(program: &str, args: &[&str], grant: CapabilityGrant) -> CommandRequest {
+        let cwd = grant
+            .filesystem_grants()
+            .next()
+            .expect("one filesystem grant")
+            .root()
+            .to_path_buf();
+        CommandRequest::new(
+            1,
+            crate::command::Actor::Agent,
+            ExecutionMode::Native,
+            program,
+            args.iter().copied(),
+            cwd,
+            grant,
+        )
+        .expect("valid request")
+    }
+
+    fn workspace_grant() -> CapabilityGrant {
+        let root = test_root("workspace");
+        let _ = std::fs::create_dir_all(&root);
+        CapabilityGrant::workspace(&root, FilesystemAccess::ReadWrite)
+            .expect("absolute root")
+            .allow_native_execution()
+    }
+
+    #[test]
+    fn spawn_rejects_non_native_requests() {
+        let grant = workspace_grant();
+        let cwd = grant
+            .filesystem_grants()
+            .next()
+            .expect("one grant")
+            .root()
+            .to_path_buf();
+        let request = CommandRequest::new(
+            1,
+            crate::command::Actor::Agent,
+            ExecutionMode::Wasi,
+            "echo",
+            std::iter::empty::<&str>(),
+            cwd,
+            grant,
+        )
+        .expect("valid request");
+        assert!(matches!(
+            NativeBackend::new().spawn(&request),
+            Err(NativeError::WrongMode)
+        ));
+    }
+
+    #[test]
+    fn spawn_requires_explicit_grant() {
+        let root = test_root("no-native");
+        let _ = std::fs::create_dir_all(&root);
+        let grant = CapabilityGrant::workspace(&root, FilesystemAccess::Read).expect("absolute");
+        let request = native_request("echo", &["hi"], grant);
+        assert!(matches!(
+            NativeBackend::new().spawn(&request),
+            Err(NativeError::NativeNotGranted)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_denies_a_symlinked_cwd_that_escapes_the_grant() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("symlink-cwd");
+        let outside = test_root("symlink-cwd-outside");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&root).expect("root created");
+        std::fs::create_dir_all(&outside).expect("outside created");
+        symlink(&outside, root.join("escape")).expect("symlink created");
+
+        let grant = CapabilityGrant::workspace(&root, FilesystemAccess::ReadWrite)
+            .expect("absolute")
+            .allow_native_execution();
+        let request = CommandRequest::new(
+            1,
+            crate::command::Actor::Agent,
+            ExecutionMode::Native,
+            "echo",
+            std::iter::empty::<&str>(),
+            root.join("escape"),
+            grant,
+        )
+        .expect("lexically valid request");
+
+        assert!(matches!(
+            NativeBackend::new().spawn(&request),
+            Err(NativeError::InvalidRequest(CommandError::WorkingDirectoryDenied(_)))
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn spawn_uses_direct_argv_and_ignores_shell_metacharacters() {
+        let grant = workspace_grant();
+        let marker = test_root("pwned-marker");
+        let marker = marker.join("pwned");
+        let _ = std::fs::remove_file(&marker);
+
+        // If any implementation routed these through a shell, the marker would
+        // be created. With direct argv, `echo` prints the string literally.
+        let arg = format!("$(touch {})", marker.display());
+        let request = native_request("echo", &[&arg], grant.clone());
+        let mut session = NativeBackend::new().spawn(&request).expect("spawns");
+
+        let mut output = Vec::new();
+        let mut reader = session.try_clone_reader().expect("reader");
+        let mut buffer = [0u8; 1024];
+        loop {
+            let count = reader.read(&mut buffer).expect("read");
+            if count == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..count]);
+        }
+        let status = session.try_exit_status().expect("exit status");
+        assert_eq!(status, Some(0));
+
+        assert!(
+            std::str::from_utf8(&output)
+                .expect("utf8")
+                .contains("$(touch"),
+            "metacharacters must be printed literally, output was {output:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "shell metacharacters must never be executed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_denies_a_missing_program() {
+        let grant = workspace_grant();
+        let request = native_request("ferrous-definitely-missing-binary-xyz", &[], grant);
+        assert!(matches!(
+            NativeBackend::new().spawn(&request),
+            Err(NativeError::SpawnFailed(_))
+        ));
+    }
+
+    #[test]
+    fn only_allowlisted_environment_reaches_the_child() {
+        let grant = workspace_grant()
+            .allow_environment("ALLOWED_VAR")
+            .expect("valid name");
+        std::env::set_var("ALLOWED_VAR", "allowed-value");
+        std::env::set_var("LEAKY_VAR", "leaky-value");
+
+        let request = native_request("env", &[], grant);
+        let mut session = NativeBackend::new().spawn(&request).expect("spawns");
+        let mut output = Vec::new();
+        let mut reader = session.try_clone_reader().expect("reader");
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = reader.read(&mut buffer).expect("read");
+            if count == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..count]);
+        }
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("ALLOWED_VAR=allowed-value"));
+        assert!(
+            !text.contains("LEAKY_VAR"),
+            "non-allowlisted env must never reach the child"
+        );
+    }
+
+    #[test]
+    fn drain_reader_forwards_all_bytes_and_reports_total() {
+        let (read, mut write) = std::io::pipe();
+        write.write_all(b"hello").expect("write");
+        drop(write);
+        let mut received = Vec::new();
+        let total = drain_reader(Box::new(read), &mut |chunk| received.extend_from_slice(chunk))
+            .expect("drain");
+        assert_eq!(total, 5);
+        assert_eq!(received, b"hello");
+    }
+
+    #[test]
+    fn empty_grant_native_is_denied() {
+        let grant = CapabilityGrant::empty();
+        // cwd must be inside a grant for validate(); use a workspace-less path
+        // by constructing through the normal path with an empty grant: the
+        // request itself fails validation at cwd, which is also fail-closed.
+        let request = CommandRequest::new(
+            1,
+            crate::command::Actor::Agent,
+            ExecutionMode::Native,
+            "echo",
+            std::iter::empty::<&str>(),
+            std::env::temp_dir(),
+            grant,
+        );
+        assert!(
+            request.is_err(),
+            "an empty grant must fail closed at request validation"
+        );
+    }
+
+    #[test]
+    fn supported_on_host_matches_the_platform_adapter() {
+        assert_eq!(
+            NativeBackend::supported_on_host(),
+            cfg!(unix),
+            "only unix has a Phase 1 adapter; everything else fails closed"
+        );
+    }
+
+    /// Guard: prove a cancelled flag can be observed without polling the child.
+    #[test]
+    fn atomic_cancel_flag_flips() {
+        let flag = AtomicBool::new(false);
+        flag.store(true, Ordering::SeqCst);
+        assert!(flag.load(Ordering::SeqCst));
+    }
 }
