@@ -184,7 +184,8 @@ impl NativeBackend {
             builder.arg(argument);
         }
         // Only grant-allowlisted environment variables reach the child.
-        for (name, value) in selected_environment(&request.grant, &|name| std::env::var(name).ok()) {
+        for (name, value) in selected_environment(&request.grant, &|name| std::env::var(name).ok())
+        {
             builder.env(name, value);
         }
 
@@ -332,7 +333,9 @@ mod tests {
 
         assert!(matches!(
             NativeBackend::new().spawn(&request),
-            Err(NativeError::InvalidRequest(CommandError::WorkingDirectoryDenied(_)))
+            Err(NativeError::InvalidRequest(
+                CommandError::WorkingDirectoryDenied(_)
+            ))
         ));
 
         let _ = std::fs::remove_dir_all(&root);
@@ -422,8 +425,10 @@ mod tests {
         write.write_all(b"hello").expect("write");
         drop(write);
         let mut received = Vec::new();
-        let total = drain_reader(Box::new(read), &mut |chunk| received.extend_from_slice(chunk))
-            .expect("drain");
+        let total = drain_reader(Box::new(read), &mut |chunk| {
+            received.extend_from_slice(chunk)
+        })
+        .expect("drain");
         assert_eq!(total, 5);
         assert_eq!(received, b"hello");
     }
