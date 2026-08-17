@@ -368,6 +368,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
+    #[cfg(unix)]
     #[test]
     fn spawn_uses_direct_argv_and_ignores_shell_metacharacters() {
         let grant = workspace_grant();
@@ -376,9 +377,11 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
 
         // If any implementation routed these through a shell, the marker would
-        // be created. With direct argv, `echo` prints the string literally.
+        // be created. With direct argv, /bin/echo prints the string literally.
+        // (/bin/echo is a real executable — `echo` alone is a shell builtin
+        // and cannot be exec'd without a shell.)
         let arg = format!("$(touch {})", marker.display());
-        let request = native_request("echo", &[&arg], grant.clone());
+        let request = native_request("/bin/echo", &[&arg], grant.clone());
         let mut session = NativeBackend::new().spawn(&request).expect("spawns");
 
         let mut output = Vec::new();
