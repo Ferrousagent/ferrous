@@ -213,8 +213,8 @@ impl NativeBackend {
 ///
 /// Kept as a free function so the session driver's reader thread has a
 /// testable pure helper; `emit` forwards chunks to `SessionEvent::Output`.
-/// Consumed by the native session driver (next task); currently exercised
-/// by unit tests only, which keeps the dead-code lint quiet.
+/// Test-only until the session driver (next task) consumes it.
+#[cfg(test)]
 pub(crate) fn drain_reader(
     mut reader: Box<dyn Read + Send>,
     emit: &mut dyn FnMut(&[u8]),
