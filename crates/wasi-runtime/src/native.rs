@@ -359,7 +359,7 @@ mod tests {
         // be created. With direct argv, `echo` prints the string literally.
         let arg = format!("$(touch {})", marker.display());
         let request = native_request("echo", &[&arg], grant.clone());
-        let session = NativeBackend::new().spawn(&request).expect("spawns");
+        let mut session = NativeBackend::new().spawn(&request).expect("spawns");
 
         let mut output = Vec::new();
         let mut reader = session.try_clone_reader().expect("reader");
@@ -410,7 +410,7 @@ mod tests {
         assert!(!grant.allows_environment("LEAKY_VAR"));
 
         let request = native_request("env", &[], grant);
-        let mut session = NativeBackend::new().spawn(&request).expect("spawns");
+        let session = NativeBackend::new().spawn(&request).expect("spawns");
         let mut output = Vec::new();
         let mut reader = session.try_clone_reader().expect("reader");
         let mut buffer = [0u8; 4096];
