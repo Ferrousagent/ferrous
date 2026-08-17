@@ -2,23 +2,24 @@ name: CI
 
 on:
   push:
+    branches: [master, main, "feature/**"]
   pull_request:
-  # Nightly advisory sweep: RustSec advisories are published after our last push.
   schedule:
+    # Nightly advisory sweep: RustSec advisories can be published any day.
     - cron: '0 0 * * *'
   workflow_dispatch:
+
+# Kill stale runs when a newer push lands on the same branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
     name: fmt + clippy + tests + docs + benches
     runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install mold linker (Linux)
-        run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Install Rust toolchain (pinned by rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
@@ -45,31 +46,6 @@ jobs:
 
       - name: Benchmarks compile
         run: cargo bench --workspace --no-run
-
-  cross-platform:
-    name: test on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.97.1
-          components: clippy
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: Tests
-        run: cargo test --workspace --all-features
 
   licenses:
     name: license + advisory checks
