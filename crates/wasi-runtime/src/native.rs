@@ -85,13 +85,14 @@ impl NativeSession {
 
     /// Resize the PTY viewport.
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), NativeError> {
-        self.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
-        Ok(())
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|error| NativeError::SpawnFailed(error.to_string()))
     }
 
     /// A reader clone for the output-draining thread.
@@ -104,7 +105,7 @@ impl NativeSession {
     /// Poll whether the child has exited, returning its exit code.
     pub fn try_exit_status(&mut self) -> Result<Option<i32>, NativeError> {
         match self.child.try_wait()? {
-            Some(status) => Ok(Some(status.exit_code)),
+            Some(status) => Ok(Some(status.exit_code())),
             None => Ok(None),
         }
     }
@@ -427,7 +428,7 @@ mod tests {
 
     #[test]
     fn drain_reader_forwards_all_bytes_and_reports_total() {
-        let (read, mut write) = std::io::pipe();
+        let (read, mut write) = std::io::pipe().expect("pipe");
         write.write_all(b"hello").expect("write");
         drop(write);
         let mut received = Vec::new();
