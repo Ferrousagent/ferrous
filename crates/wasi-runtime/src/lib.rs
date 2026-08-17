@@ -557,7 +557,6 @@ mod contract_tests {
     use super::command::{
         Actor, CommandRequest, ExecutionMode, SessionEvent, SessionState, Stream,
     };
-    use super::native::{NativeBackend, NativeError};
     use super::{RuntimeError, WasiRuntime};
 
     #[test]
