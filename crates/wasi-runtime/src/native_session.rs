@@ -202,7 +202,7 @@ impl NativeSessionHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
 
-        match *kill_reason
+        match kill_reason
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .unwrap_or(NativeStop::Exited)
