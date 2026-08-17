@@ -457,8 +457,8 @@ mod tests {
     /// Poll `try_exit_status` until the child is reaped or `deadline_ms`
     /// elapses. The PTY can report EOF a moment before the child is reaped.
     fn poll_exit(session: &mut NativeSession, deadline_ms: u64) -> Result<Option<u32>, NativeError> {
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_millis(deadline_ms);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(deadline_ms);
         loop {
             if let Some(status) = session.try_exit_status()? {
                 return Ok(Some(status));
