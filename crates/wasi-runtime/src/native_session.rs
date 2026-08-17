@@ -18,9 +18,9 @@
 //! three threads, so no task, fd, or process leaks.
 
 use std::io::Write;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::cancel::CancelHandle;
