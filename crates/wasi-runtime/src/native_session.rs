@@ -283,16 +283,13 @@ mod tests {
         let budget = 64;
         let limits = ResourceLimits::new(budget, 30).expect("valid limits");
         let request = native_request("/bin/sh", &["-c", "yes x"], limits);
-        let session = NativeBackend::new().spawn(&request).expect("session spawns");
+        let session = NativeBackend::new()
+            .spawn(&request)
+            .expect("session spawns");
         let (events, receiver) = mpsc::channel();
         let runner = std::thread::spawn(move || {
-            NativeSessionHandle::new(
-                session,
-                CancelHandle::new(),
-                request.grant.limits(),
-                events,
-            )
-            .run()
+            NativeSessionHandle::new(session, CancelHandle::new(), request.grant.limits(), events)
+                .run()
         });
 
         let mut emitted = 0usize;
