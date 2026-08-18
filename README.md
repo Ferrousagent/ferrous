@@ -25,13 +25,15 @@ The Phase 1 security core — everything else in the product builds on this:
   - live streaming of terminal events to the UI boundary;
   - a serialized action broker with human-in-the-loop approval for risky
     actions and an audit trail;
-  - a fail-closed native backend: native execution is never silently
-    performed — unsupported hosts return `unsupported`, they do not fall
-    back to ambient execution;
+  - an approval-gated native PTY backend on Unix, using direct argv,
+    allowlisted environment variables, bounded output, cancellation, timeout,
+    and process-tree cleanup; unsupported hosts return `unsupported` and never
+    fall back to ambient execution;
   - `#![forbid(unsafe_code)]` throughout.
 - **`ferrous`** — the headless CLI. `ferrous shell` runs explicitly selected
-  WASI components (`run-wasi <component>`); unknown input never falls through
-  to a host shell.
+  WASI components (`run-wasi <component>`) and approved native PTY commands
+  (`run-native --allow -- <program> [args]`); unknown input never falls
+  through to a host shell.
 - **`shared`** — cross-cutting types: error-handling convention and secrets
   that are unprintable by construction (no serialization of secret values).
 
