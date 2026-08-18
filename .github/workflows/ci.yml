@@ -52,6 +52,32 @@ jobs:
       - name: Benchmarks compile
         run: cargo bench --workspace --no-run
 
+  performance:
+    name: WASI hot-path benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (pinned by rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Criterion hot-path benchmarks
+        run: cargo bench -p wasi-runtime --bench runtime_hot_paths -- --noplot
+
+      - name: Upload Criterion report
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasi-runtime-criterion-report
+          path: target/criterion
+          if-no-files-found: error
+
   licenses:
     name: license + advisory checks
     runs-on: ubuntu-latest
