@@ -338,9 +338,9 @@ mod tests {
         finished
             .accept(SessionEvent::Exited { code: Some(0) })
             .expect("exits");
-        for event in events.iter().cloned() {
+        for event in events.iter() {
             assert!(
-                finished.accept(event).is_err(),
+                finished.accept(event.clone()).is_err(),
                 "a finished session must reject every event, including {event:?}"
             );
         }
