@@ -903,6 +903,37 @@ mod tests {
             )
     }
 
+    fn native_grant() -> CapabilityGrant {
+        let root = std::env::temp_dir().join(format!(
+            "ferrous-native-broker-workspace-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        CapabilityGrant::workspace(&root, FilesystemAccess::ReadWrite)
+            .expect("temporary root is absolute")
+            .allow_native_execution()
+    }
+
+    fn native_request(id: u64, program: &str, args: &[&str]) -> CommandRequest {
+        let grant = native_grant();
+        let cwd = grant
+            .filesystem_grants()
+            .next()
+            .expect("one filesystem grant")
+            .root()
+            .to_path_buf();
+        CommandRequest::new(
+            id,
+            Actor::Agent,
+            ExecutionMode::Native,
+            program,
+            args.iter().copied(),
+            cwd,
+            grant,
+        )
+        .expect("native request is valid")
+    }
+
     fn request(
         broker: &ActionBroker,
         id: u64,
@@ -910,7 +941,7 @@ mod tests {
         wat: &str,
         grant: CapabilityGrant,
     ) -> (Component, CommandRequest) {
-        let bytes = wat::parse_str(wat).expect("valid WAT");
+                let bytes = wat::parse_str(wat).expect("valid WAT");
         let component = broker
             .compile_component(&bytes)
             .expect("component admission");
@@ -1454,6 +1485,191 @@ mod tests {
             }
         }
         panic!("a never reported cancellation");
+    }
+
+    #[test]
+    fn native_submission_requires_approval_then_streams_output() {
+        let broker = ActionBroker::new().expect("broker");
+        let request = native_request(1, "/bin/echo", &["hello from native"]);
+        let events = broker
+            .submit_native_streaming(request)
+            .expect("native request submitted");
+
+        assert_eq!(
+            events
+                .recv_timeout(Duration::from_secs(10))
+                .expect("approval event"),
+            SessionEvent::PendingApproval {
+                reason: ApprovalReason::NativeExecution
+            }
+        );
+        broker.approve(1).expect("approval accepted");
+        assert_eq!(
+            events
+                .recv_timeout(Duration::from_secs(10))
+                .expect("started event"),
+            SessionEvent::Started
+        );
+
+        let output = events
+            .recv_timeout(Duration::from_secs(10))
+            .expect("output or exit event");
+        assert!(
+            matches!(output, SessionEvent::Output { ref bytes, .. } if bytes.windows(5).any(|window| window == b"hello")),
+            "native output must be streamed, got {output:?}"
+        );
+        assert_eq!(
+            events
+                .recv_timeout(Duration::from_secs(10))
+                .expect("exit event"),
+            SessionEvent::Exited { code: Some(0) }
+        );
+    }
+
+    #[test]
+    fn send_input_reaches_a_running_native_session() {
+        let broker = ActionBroker::new().expect("broker");
+        let request = native_request(1, "/bin/cat", &[]);
+        let events = broker
+            .submit_native_streaming(request)
+            .expect("native request submitted");
+        assert!(matches!(
+            events
+                .recv_timeout(Duration::from_secs(10))
+                .expect("approval event"),
+            SessionEvent::PendingApproval { .. }
+        ));
+        broker.approve(1).expect("approval accepted");
+        assert_eq!(
+            events
+                .recv_timeout(Duration::from_secs(10))
+                .expect("started event"),
+            SessionEvent::Started
+        );
+
+        broker
+            .send_input(1, b"hello through the pty\n".to_vec())
+            .expect("input reaches native session");
+        let mut saw_echo = false;
+        for _ in 0..4 {
+            if let SessionEvent::Output { bytes, .. } = events
+                .recv_timeout(Duration::from_secs(5))
+                .expect("native output")
+            {
+                if bytes.windows(5).any(|window| window == b"hello") {
+                    saw_echo = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_echo, "PTY input must be echoed by cat");
+        broker.cancel(1).expect("cat is cancellable");
+        assert_eq!(
+            events
+                .recv_timeout(Duration::from_secs(5))
+                .expect("cancel event"),
+            SessionEvent::Cancelled
+        );
+    }
+
+    #[test]
+    fn send_input_to_a_wasi_session_is_rejected_as_not_native() {
+        let broker = ActionBroker::new().expect("broker");
+        let (component, request) =
+            request(&broker, 1, "spin", SPIN_WAT, grant(60, 4_000_000_000));
+        let events = broker
+            .submit_streaming(component, request)
+            .expect("WASI request submitted");
+        assert_eq!(
+            events
+                .recv_timeout(Duration::from_secs(10))
+                .expect("started event"),
+            SessionEvent::Started
+        );
+        assert!(matches!(
+            broker.send_input(1, b"not native".to_vec()),
+            Err(BrokerError::NotNative(1))
+        ));
+        broker.cancel(1).expect("WASI session is cancellable");
+        assert_eq!(
+            events
+                .recv_timeout(Duration::from_secs(5))
+                .expect("cancel event"),
+            SessionEvent::Cancelled
+        );
+    }
+
+    #[test]
+    fn denied_native_request_never_starts() {
+        let broker = ActionBroker::new().expect("broker");
+        let request = native_request(1, "/bin/false", &[]);
+        let events = broker
+            .submit_native_streaming(request)
+            .expect("native request submitted");
+        assert!(matches!(
+            events
+                .recv_timeout(Duration::from_secs(10))
+                .expect("approval event"),
+            SessionEvent::PendingApproval { .. }
+        ));
+        broker.deny(1).expect("denial accepted");
+        assert_eq!(
+            events
+                .recv_timeout(Duration::from_secs(5))
+                .expect("denied event"),
+            SessionEvent::Denied
+        );
+        assert!(
+            events.recv_timeout(Duration::from_millis(200)).is_err(),
+            "denied native sessions must not start"
+        );
+    }
+
+    #[test]
+    fn native_cancel_reports_cancelled_and_releases_the_session() {
+        let broker = ActionBroker::new().expect("broker");
+        let request = native_request(1, "/bin/sleep", &["100"]);
+        let events = broker
+            .submit_native_streaming(request)
+            .expect("native request submitted");
+        assert!(matches!(
+            events
+                .recv_timeout(Duration::from_secs(10))
+                .expect("approval event"),
+            SessionEvent::PendingApproval { .. }
+        ));
+        broker.approve(1).expect("approval accepted");
+        assert_eq!(
+            events
+                .recv_timeout(Duration::from_secs(10))
+                .expect("started event"),
+            SessionEvent::Started
+        );
+        broker.cancel(1).expect("native session is cancellable");
+        assert_eq!(
+            events
+                .recv_timeout(Duration::from_secs(5))
+                .expect("cancel event"),
+            SessionEvent::Cancelled
+        );
+        for _ in 0..50 {
+            if broker.outstanding_sessions() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(broker.outstanding_sessions(), 0);
+    }
+
+    #[test]
+    fn submit_native_rejects_a_wasi_request() {
+        let broker = ActionBroker::new().expect("broker");
+        let (component, request) = request(&broker, 1, "hello", HELLO_WAT, grant(30, 1_000_000));
+        drop(component);
+        assert!(matches!(
+            broker.submit_native(request),
+            Err(BrokerError::NotNativeRequest)
+        ));
     }
 
     #[test]
