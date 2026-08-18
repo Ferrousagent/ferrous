@@ -23,6 +23,8 @@ use thiserror::Error;
 use wasmtime::component::Component;
 
 use crate::cancel::CancelHandle;
+use crate::native::{NativeBackend, NativeError};
+use crate::native_session::NativeSessionHandle;
 use crate::command::{
     ApprovalReason, CommandError, CommandRequest, ExecutionMode, SessionEvent, SessionState,
 };
@@ -45,9 +47,18 @@ pub enum BrokerError {
     /// The worker thread stopped, so the queue is no longer served.
     #[error("the broker worker stopped unexpectedly")]
     WorkerStopped,
-    /// The broker only executes WASI requests.
-    #[error("the broker currently executes WASI requests only")]
+    /// The request selected the wrong backend for this submission method.
+    #[error("the request is not a WASI request")]
     NotWasi,
+    /// The request selected WASI but was submitted to the native backend.
+    #[error("the request is not a native request")]
+    NotNativeRequest,
+    /// The session exists but is not a native PTY session.
+    #[error("session {0} is not a native session")]
+    NotNative(u64),
+    /// The native backend failed.
+    #[error("native backend failure: {0}")]
+    Native(#[from] NativeError),
     /// The request failed validation.
     #[error("invalid request: {0}")]
     InvalidRequest(#[from] CommandError),
@@ -84,8 +95,10 @@ pub enum BrokerOutcome {
     Cancelled,
     /// The request was denied before it could start.
     Denied(CommandError),
-    /// The backend failed; the guest may have been interrupted by a limit.
+    /// The WASI backend failed; the guest may have been interrupted by a limit.
     Failed(RuntimeError),
+    /// The native backend failed before or during a PTY session.
+    NativeFailed(NativeError),
 }
 
 /// How the broker admitted (or rejected) a session, recorded for audit.
@@ -143,9 +156,20 @@ enum JobSink {
 }
 
 /// One queued, parked, or running execution.
+enum JobKind {
+    Wasi(Component),
+    Native,
+}
+
+impl JobKind {
+    fn is_native(&self) -> bool {
+        matches!(self, Self::Native)
+    }
+}
+
 struct Job {
     request: CommandRequest,
-    component: Component,
+    kind: JobKind,
     sink: JobSink,
     session: SessionState,
     /// How this job was admitted; recorded in the audit trail at completion.
@@ -162,6 +186,7 @@ struct PendingJob {
 struct BrokerState {
     handles: Mutex<HashMap<u64, CancelHandle>>,
     pending: Mutex<HashMap<u64, PendingJob>>,
+    inputs: Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>,
     audit: Mutex<Vec<AuditEntry>>,
     approval_timeout: Duration,
     /// Test-only: the next job id whose worker execution should panic, used to
@@ -199,9 +224,11 @@ pub const DEFAULT_MAX_AUDIT_ENTRIES: usize = 4096;
 pub struct ActionBroker {
     engine: wasmtime::Engine,
     queue_tx: mpsc::Sender<Job>,
+    native_queue_tx: mpsc::Sender<Job>,
     state: Arc<BrokerState>,
     capacity: usize,
     worker: Option<JoinHandle<()>>,
+    native_worker: Option<JoinHandle<()>>,
     sweeper: Option<JoinHandle<()>>,
     stopped: Arc<AtomicBool>,
 }
@@ -226,9 +253,11 @@ impl ActionBroker {
         let runtime = WasiRuntime::new()?;
         let engine = runtime.engine().clone();
         let (queue_tx, queue_rx) = mpsc::channel::<Job>();
+        let (native_queue_tx, native_queue_rx) = mpsc::channel::<Job>();
         let state = Arc::new(BrokerState {
             handles: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            inputs: Mutex::new(HashMap::new()),
             audit: Mutex::new(Vec::new()),
             approval_timeout,
             #[cfg(test)]
@@ -236,6 +265,9 @@ impl ActionBroker {
         });
         let worker_state = state.clone();
         let worker = std::thread::spawn(move || worker_loop(runtime, queue_rx, worker_state));
+        let native_worker_state = state.clone();
+        let native_worker =
+            std::thread::spawn(move || native_worker_loop(native_queue_rx, native_worker_state));
         let sweeper_state = state.clone();
         let sweeper_stopped = Arc::new(AtomicBool::new(false));
         let sweeper_stop = sweeper_stopped.clone();
@@ -243,9 +275,11 @@ impl ActionBroker {
         Ok(Self {
             engine,
             queue_tx,
+            native_queue_tx,
             state,
             capacity,
             worker: Some(worker),
+            native_worker: Some(native_worker),
             sweeper: Some(sweeper),
             stopped: sweeper_stopped,
         })
@@ -299,7 +333,7 @@ impl ActionBroker {
         let job = Job {
             session: SessionState::new(request.id, request.grant.limits()),
             request,
-            component,
+            kind: JobKind::Wasi(component),
             sink: JobSink::Outcome(result_tx),
             admission: ApprovalDecision::AutoApproved,
         };
@@ -326,7 +360,7 @@ impl ActionBroker {
         let job = Job {
             session: SessionState::new(request.id, request.grant.limits()),
             request,
-            component,
+            kind: JobKind::Wasi(component),
             sink: JobSink::Events(event_tx),
             admission: ApprovalDecision::AutoApproved,
         };
@@ -345,11 +379,20 @@ impl ActionBroker {
         if handles.len() >= self.capacity {
             return Err(BrokerError::QueueFull);
         }
-        let handle = CancelHandle::new();
-        handles.insert(id, handle);
+        handles.insert(id, CancelHandle::new());
         drop(handles);
-        if self.queue_tx.send(job).is_err() {
-            // The worker is gone; do not leave a phantom session registered.
+        self.send_job(job)
+    }
+
+    /// Send a job to the queue for its selected backend.
+    fn send_job(&self, job: Job) -> Result<(), BrokerError> {
+        let id = job.request.id;
+        let sender = if job.kind.is_native() {
+            &self.native_queue_tx
+        } else {
+            &self.queue_tx
+        };
+        if sender.send(job).is_err() {
             self.state
                 .handles
                 .lock()
@@ -358,6 +401,70 @@ impl ActionBroker {
             return Err(BrokerError::WorkerStopped);
         }
         Ok(())
+    }
+
+    /// Submit an approved-capable native request in capturing mode.
+    pub fn submit_native(
+        &self,
+        request: CommandRequest,
+    ) -> Result<mpsc::Receiver<BrokerOutcome>, BrokerError> {
+        request.validate()?;
+        if request.mode != ExecutionMode::Native {
+            return Err(BrokerError::NotNativeRequest);
+        }
+        let (result_tx, result_rx) = mpsc::channel();
+        self.enqueue(Job {
+            session: SessionState::new(request.id, request.grant.limits()),
+            request,
+            kind: JobKind::Native,
+            sink: JobSink::Outcome(result_tx),
+            admission: ApprovalDecision::AutoApproved,
+        })?;
+        Ok(result_rx)
+    }
+
+    /// Submit an approved-capable native request with live PTY events.
+    pub fn submit_native_streaming(
+        &self,
+        request: CommandRequest,
+    ) -> Result<mpsc::Receiver<SessionEvent>, BrokerError> {
+        request.validate()?;
+        if request.mode != ExecutionMode::Native {
+            return Err(BrokerError::NotNativeRequest);
+        }
+        let (event_tx, event_rx) = mpsc::channel();
+        self.enqueue(Job {
+            session: SessionState::new(request.id, request.grant.limits()),
+            request,
+            kind: JobKind::Native,
+            sink: JobSink::Events(event_tx),
+            admission: ApprovalDecision::AutoApproved,
+        })?;
+        Ok(event_rx)
+    }
+
+    /// Send raw PTY input to a running native session.
+    pub fn send_input(&self, id: u64, bytes: Vec<u8>) -> Result<(), BrokerError> {
+        let input = self
+            .state
+            .inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+            .cloned();
+        if let Some(input) = input {
+            return input.send(bytes).map_err(|_| BrokerError::WorkerStopped);
+        }
+        if self
+            .state
+            .handles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&id)
+        {
+            return Err(BrokerError::NotNative(id));
+        }
+        Err(BrokerError::UnknownSession(id))
     }
 
     /// Approve a session parked awaiting approval and let it run.
@@ -398,15 +505,7 @@ impl ActionBroker {
             return Ok(());
         }
         job.admission = ApprovalDecision::Approved;
-        if self.queue_tx.send(job).is_err() {
-            self.state
-                .handles
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&id);
-            return Err(BrokerError::WorkerStopped);
-        }
-        Ok(())
+        self.send_job(job)
     }
 
     /// Deny a session parked awaiting approval; it never runs.
@@ -501,8 +600,12 @@ impl Drop for ActionBroker {
         // Close the queue first: dropping the last sender makes the worker's
         // blocking recv() return, so joining below cannot deadlock.
         let _ = std::mem::replace(&mut self.queue_tx, mpsc::channel::<Job>().0);
+        let _ = std::mem::replace(&mut self.native_queue_tx, mpsc::channel::<Job>().0);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+        if let Some(native_worker) = self.native_worker.take() {
+            let _ = native_worker.join();
         }
         if let Some(sweeper) = self.sweeper.take() {
             let _ = sweeper.join();
@@ -512,13 +615,23 @@ impl Drop for ActionBroker {
 
 fn worker_loop(runtime: WasiRuntime, queue_rx: mpsc::Receiver<Job>, state: Arc<BrokerState>) {
     while let Ok(job) = queue_rx.recv() {
-        process_job_guarded(&runtime, &state, job);
+        process_job_guarded(Some(&runtime), &state, job);
+    }
+}
+
+fn native_worker_loop(queue_rx: mpsc::Receiver<Job>, state: Arc<BrokerState>) {
+    while let Ok(job) = queue_rx.recv() {
+        process_job_guarded(None, &state, job);
     }
 }
 
 /// Run one job inside a panic barrier so a guest-triggered host bug cannot
 /// kill the worker (and with it every queued session) silently.
-fn process_job_guarded(runtime: &WasiRuntime, state: &Arc<BrokerState>, job: Job) {
+fn process_job_guarded(
+    runtime: Option<&WasiRuntime>,
+    state: &Arc<BrokerState>,
+    job: Job,
+) {
     // Snapshot everything the terminal/audit paths need before the panic-prone
     // body runs, so a panic can still report the session instead of orphaning it.
     let id = job.request.id;
@@ -551,10 +664,15 @@ fn process_job_guarded(runtime: &WasiRuntime, state: &Arc<BrokerState>, job: Job
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&id);
+        state
+            .inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id);
     }
 }
 
-fn process_job(runtime: &WasiRuntime, state: &Arc<BrokerState>, mut job: Job) {
+fn process_job(runtime: Option<&WasiRuntime>, state: &Arc<BrokerState>, mut job: Job) {
     #[cfg(test)]
     if state.panic_next.swap(0, Ordering::SeqCst) == job.request.id {
         panic!("injected broker panic for red-team test");
@@ -583,7 +701,7 @@ fn process_job(runtime: &WasiRuntime, state: &Arc<BrokerState>, mut job: Job) {
         // A human already approved this specific session; run it regardless
         // of its risk class instead of parking it again.
         Risk::RequiresApproval(_) if job.admission == ApprovalDecision::Approved => {
-            let outcome = execute(runtime, &mut job, &cancel);
+            let outcome = execute(runtime, state, &mut job, &cancel);
             state.record(AuditEntry {
                 id: job.request.id,
                 actor: job.request.actor,
@@ -598,7 +716,7 @@ fn process_job(runtime: &WasiRuntime, state: &Arc<BrokerState>, mut job: Job) {
                 .remove(&job.request.id);
         }
         Risk::AutoApprove => {
-            let outcome = execute(runtime, &mut job, &cancel);
+            let outcome = execute(runtime, state, &mut job, &cancel);
             state.record(AuditEntry {
                 id: job.request.id,
                 actor: job.request.actor,
@@ -729,7 +847,18 @@ fn send_terminal(sink: &JobSink, terminal: Terminal) {
 
 /// Dispatch a job to its capturing or streaming execution path and return the
 /// terminal audit outcome.
-fn execute(runtime: &WasiRuntime, job: &mut Job, cancel: &CancelHandle) -> AuditOutcome {
+fn execute(
+    runtime: Option<&WasiRuntime>,
+    state: &Arc<BrokerState>,
+    job: &mut Job,
+    cancel: &CancelHandle,
+) -> AuditOutcome {
+    if job.kind.is_native() {
+        return execute_native(state, job, cancel);
+    }
+    let Some(runtime) = runtime else {
+        return AuditOutcome::Failed;
+    };
     let streams = matches!(&job.sink, JobSink::Events(_));
     if streams {
         execute_streaming(runtime, job, cancel)
@@ -744,12 +873,133 @@ fn execute(runtime: &WasiRuntime, job: &mut Job, cancel: &CancelHandle) -> Audit
             }
             BrokerOutcome::Cancelled => AuditOutcome::Cancelled,
             BrokerOutcome::Denied(_) => AuditOutcome::Denied,
-            BrokerOutcome::Failed(_) => AuditOutcome::Failed,
+            BrokerOutcome::Failed(_) | BrokerOutcome::NativeFailed(_) => AuditOutcome::Failed,
         };
         if let JobSink::Outcome(result_tx) = &job.sink {
             let _ = result_tx.send(outcome);
         }
         audit
+    }
+}
+
+/// Run one native PTY job, registering its input channel only after spawn succeeds.
+fn execute_native(
+    state: &Arc<BrokerState>,
+    job: &mut Job,
+    cancel: &CancelHandle,
+) -> AuditOutcome {
+    if cancel.is_cancelled() {
+        if let JobSink::Outcome(sender) = &job.sink {
+            let _ = sender.send(BrokerOutcome::Cancelled);
+        } else if let JobSink::Events(sender) = &job.sink {
+            let _ = sender.send(SessionEvent::Cancelled);
+        }
+        return AuditOutcome::Cancelled;
+    }
+
+    let session = match NativeBackend::new().spawn(&job.request) {
+        Ok(session) => session,
+        Err(error) => {
+            let cancelled = matches!(&error, NativeError::Cancelled);
+            match &job.sink {
+                JobSink::Outcome(sender) => {
+                    if cancelled {
+                        let _ = sender.send(BrokerOutcome::Cancelled);
+                    } else {
+                        let _ = sender.send(BrokerOutcome::NativeFailed(error));
+                    }
+                }
+                JobSink::Events(sender) => {
+                    let _ = sender.send(if cancelled {
+                        SessionEvent::Cancelled
+                    } else {
+                        SessionEvent::Unsupported
+                    });
+                }
+            }
+            return if cancelled {
+                AuditOutcome::Cancelled
+            } else {
+                AuditOutcome::Failed
+            };
+        }
+    };
+
+    let event_tx = match &job.sink {
+        JobSink::Events(sender) => sender.clone(),
+        JobSink::Outcome(_) => {
+            let (sender, receiver) = mpsc::channel();
+            drop(receiver);
+            sender
+        }
+    };
+    let handle = NativeSessionHandle::new(
+        session,
+        cancel.clone(),
+        job.request.grant.limits(),
+        event_tx,
+    );
+    state
+        .inputs
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(job.request.id, handle.input_sender());
+
+    let _ = job.session.accept(SessionEvent::Started);
+    if let JobSink::Events(sender) = &job.sink {
+        let _ = sender.send(SessionEvent::Started);
+    }
+    let result = handle.run();
+    state
+        .inputs
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&job.request.id);
+
+    match result {
+        Ok(output) => {
+            let exit_code = i32::try_from(output.exit_code).unwrap_or(i32::MAX);
+            match &job.sink {
+                JobSink::Outcome(sender) => {
+                    let _ = sender.send(BrokerOutcome::Completed(output));
+                }
+                JobSink::Events(sender) => {
+                    let _ = job.session.accept(SessionEvent::Exited {
+                        code: Some(exit_code),
+                    });
+                    let _ = sender.send(SessionEvent::Exited {
+                        code: Some(exit_code),
+                    });
+                }
+            }
+            AuditOutcome::Completed { exit_code }
+        }
+        Err(error) => {
+            let cancelled = matches!(&error, NativeError::Cancelled);
+            match &job.sink {
+                JobSink::Outcome(sender) => {
+                    if cancelled {
+                        let _ = sender.send(BrokerOutcome::Cancelled);
+                    } else {
+                        let _ = sender.send(BrokerOutcome::NativeFailed(error));
+                    }
+                }
+                JobSink::Events(sender) => {
+                    if cancelled {
+                        let _ = job.session.accept(SessionEvent::Cancelled);
+                        let _ = sender.send(SessionEvent::Cancelled);
+                    } else {
+                        let _ = job.session.accept(SessionEvent::Unsupported);
+                        let _ = sender.send(SessionEvent::Unsupported);
+                    }
+                }
+            }
+            if cancelled {
+                AuditOutcome::Cancelled
+            } else {
+                AuditOutcome::Failed
+            }
+        }
     }
 }
 
@@ -762,7 +1012,10 @@ fn execute_capturing(runtime: &WasiRuntime, job: &mut Job, cancel: &CancelHandle
     if job.session.accept(SessionEvent::Started).is_err() {
         return BrokerOutcome::Denied(CommandError::InvalidTransition("session cannot start"));
     }
-    match runtime.run_wasi_cancellable(&job.component, &job.request, cancel) {
+    let JobKind::Wasi(component) = &job.kind else {
+        return BrokerOutcome::NativeFailed(NativeError::WrongMode);
+    };
+    match runtime.run_wasi_cancellable(component, &job.request, cancel) {
         Ok(output) => {
             let _ = job.session.accept(SessionEvent::Exited {
                 code: Some(output.exit_code),
@@ -803,7 +1056,11 @@ fn execute_streaming(runtime: &WasiRuntime, job: &mut Job, cancel: &CancelHandle
         return AuditOutcome::Denied;
     }
     let _ = events.send(SessionEvent::Started);
-    match runtime.run_wasi_events(&job.component, &job.request, cancel, events) {
+    let JobKind::Wasi(component) = &job.kind else {
+        let _ = events.send(SessionEvent::Unsupported);
+        return AuditOutcome::Failed;
+    };
+    match runtime.run_wasi_events(component, &job.request, cancel, events) {
         Ok(output) => {
             let _ = job.session.accept(SessionEvent::Exited {
                 code: Some(output.exit_code),
@@ -1575,8 +1832,7 @@ mod tests {
     #[test]
     fn send_input_to_a_wasi_session_is_rejected_as_not_native() {
         let broker = ActionBroker::new().expect("broker");
-        let (component, request) =
-            request(&broker, 1, "spin", SPIN_WAT, grant(60, 4_000_000_000));
+        let (component, request) = request(&broker, 1, "spin", SPIN_WAT, grant(60, 4_000_000_000));
         let events = broker
             .submit_streaming(component, request)
             .expect("WASI request submitted");
@@ -1717,6 +1973,7 @@ mod tests {
         let state = Arc::new(BrokerState {
             handles: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            inputs: Mutex::new(HashMap::new()),
             audit: Mutex::new(Vec::new()),
             approval_timeout: Duration::from_secs(30),
             panic_next: AtomicU64::new(0),
