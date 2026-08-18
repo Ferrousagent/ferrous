@@ -27,6 +27,13 @@ struct WasiCommand {
     args: Vec<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct NativeCommand {
+    explicitly_allowed: bool,
+    program: String,
+    args: Vec<String>,
+}
+
 /// Run the interactive shell until `exit`/`quit` or EOF.
 ///
 /// # Errors
@@ -232,6 +239,39 @@ mod tests {
             panic!("expected a reply");
         };
         assert!(reply.contains("unsupported"));
+    }
+
+    #[test]
+    fn parses_run_native_with_direct_args() {
+        let parsed = parse_native_command("run-native --allow -- cargo test")
+            .expect("native command parses");
+        assert_eq!(
+            parsed,
+            NativeCommand {
+                explicitly_allowed: true,
+                program: "cargo".to_owned(),
+                args: vec!["test".to_owned()],
+            }
+        );
+    }
+
+    #[test]
+    fn run_native_without_allow_flag_is_rejected_by_the_parser() {
+        let parsed = parse_native_command("run-native cargo test")
+            .expect("native command parses for policy rejection");
+        assert!(!parsed.explicitly_allowed);
+        assert_eq!(parsed.program, "cargo");
+        assert_eq!(parsed.args, ["test"]);
+    }
+
+    #[test]
+    fn run_native_preserves_quoted_metacharacters_as_one_argument() {
+        let parsed = parse_native_command(
+            "run-native --allow -- sh -lc 'echo hi > /tmp/pwned'",
+        )
+        .expect("native command parses");
+        assert_eq!(parsed.program, "sh");
+        assert_eq!(parsed.args, ["-lc", "echo hi > /tmp/pwned"]);
     }
 
     #[test]
