@@ -13,9 +13,36 @@ adapter is implemented and tested.
 | R34 | Shell metacharacters could become unintended commands. | Native requests use structured `CommandBuilder` argv directly; the CLI tokenizer only groups arguments and never executes a shell string. | `native::tests::spawn_uses_direct_argv_and_ignores_shell_metacharacters`; `shell::tests::run_native_preserves_quoted_metacharacters_as_one_argument` |
 | R35 | A cancelled command could orphan descendants. | Unix PTY sessions are killed through the platform process-group boundary; teardown waits for the process and owned threads to finish. | `native_session::tests::cancellation_kills_the_native_process_tree` |
 
+## Performance evidence
+
+The cached GitHub Actions performance job runs:
+
+```text
+cargo bench -p wasi-runtime --bench runtime_hot_paths -- --noplot
+```
+
+Run [`32143931729`](https://github.com/Ferrousagent/ferrous/actions/runs/32143931729)
+measured the following Criterion medians on `ubuntu-latest`:
+
+| Hot path | Median |
+| --- | ---: |
+| Command request validation | 124.10 ns |
+| Allowlisted environment selection | 76.778 ns |
+| Loopback network policy check | 2.5681 ns |
+| Bounded pipe write and drain | 245.47 ns |
+
+These are policy and streaming primitives, not end-to-end execution latency.
+Process creation, PTY setup, Wasmtime compilation, guest startup, and UI
+transport are intentionally separate measurements and are not claimed to be
+sub-millisecond.
+
 ## Remaining platform scope
 
 - Windows ConPTY and any future non-Unix native policy adapter remain
   fail-closed until they have equivalent process-tree and policy tests.
 - The human-facing terminal renderer (wterm or another renderer) remains a
   later UI-phase adapter. The backend contract is renderer-independent.
+- Passing CI and microbenchmarks are evidence of tested behavior, not proof of
+  zero bugs, formal verification, or bank/healthcare certification. Production
+  deployment still requires independent security review, threat modeling,
+  OS-level sandboxing, secrets governance, and operational controls.
