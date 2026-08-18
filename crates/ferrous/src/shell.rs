@@ -8,9 +8,10 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use wasi_runtime::WasiRuntime;
+use wasi_runtime::broker::ActionBroker;
 use wasi_runtime::capability::{CapabilityGrant, FilesystemAccess};
-use wasi_runtime::command::{Actor, CommandRequest, ExecutionMode};
+use wasi_runtime::command::{Actor, CommandRequest, ExecutionMode, SessionEvent};
+use wasi_runtime::WasiRuntime;
 
 /// The result of handling a single built-in shell line.
 #[derive(Debug, PartialEq, Eq)]
@@ -47,6 +48,7 @@ pub fn run() -> Result<()> {
         .canonicalize()
         .context("failed to canonicalize the shell workspace")?;
     let mut runtime = None;
+    let mut broker = None;
     let mut session_id = 0_u64;
 
     tracing::info!(workspace = %workspace.display(), "ferrous shell started (Phase 1)");
@@ -80,6 +82,27 @@ pub fn run() -> Result<()> {
             {
                 break;
             }
+            continue;
+        }
+
+        if let Some(command) = parse_native_command(trimmed) {
+            if !command.explicitly_allowed {
+                if !write_line(
+                    &mut stdout,
+                    "native execution requires explicit approval: use `run-native --allow -- <program> [args]`",
+                )? {
+                    break;
+                }
+                continue;
+            }
+            session_id = session_id.saturating_add(1);
+            if broker.is_none() {
+                broker = Some(ActionBroker::new().map_err(anyhow::Error::new)?);
+            }
+            let Some(broker) = broker.as_ref() else {
+                return Err(anyhow::anyhow!("native broker was not initialized"));
+            };
+            run_native_command(broker, &workspace, session_id, command, &mut stdout)?;
             continue;
         }
 
@@ -178,6 +201,153 @@ fn parse_wasi_command(line: &str) -> Option<WasiCommand> {
     })
 }
 
+fn parse_native_command(line: &str) -> Option<NativeCommand> {
+    let tokens = tokenize_native_line(line)?;
+    if tokens.first()? != "run-native" {
+        return None;
+    }
+    if tokens.get(1).is_some_and(|token| token == "--allow") {
+        if tokens.get(2).map(String::as_str) != Some("--") {
+            return Some(NativeCommand {
+                explicitly_allowed: false,
+                program: String::new(),
+                args: Vec::new(),
+            });
+        }
+        let program = tokens.get(3)?.clone();
+        return Some(NativeCommand {
+            explicitly_allowed: true,
+            program,
+            args: tokens[4..].to_vec(),
+        });
+    }
+    let program = tokens.get(1)?.clone();
+    Some(NativeCommand {
+        explicitly_allowed: false,
+        program,
+        args: tokens[2..].to_vec(),
+    })
+}
+
+/// Tokenize native input without executing it. Quotes group an argument, while
+/// the resulting values remain direct argv entries for the PTY backend.
+fn tokenize_native_line(line: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut started = false;
+
+    for character in line.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            started = true;
+            continue;
+        }
+        match quote {
+            Some(delimiter) if character == delimiter => quote = None,
+            Some(_) => current.push(character),
+            None if character == '\\' => {
+                escaped = true;
+                started = true;
+            }
+            None if character == '\'' || character == '"' => {
+                quote = Some(character);
+                started = true;
+            }
+            None if character.is_whitespace() => {
+                if started {
+                    tokens.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            None => {
+                current.push(character);
+                started = true;
+            }
+        }
+    }
+    if escaped || quote.is_some() {
+        return None;
+    }
+    if started {
+        tokens.push(current);
+    }
+    Some(tokens)
+}
+
+fn run_native_command(
+    broker: &ActionBroker,
+    workspace: &Path,
+    session_id: u64,
+    command: NativeCommand,
+    stdout: &mut impl Write,
+) -> Result<()> {
+    let grant = CapabilityGrant::workspace(workspace.to_path_buf(), FilesystemAccess::ReadWrite)
+        .map_err(anyhow::Error::new)
+        .context("failed to create native workspace capability")?
+        .allow_native_execution();
+    let request = CommandRequest::new(
+        session_id,
+        Actor::Human,
+        ExecutionMode::Native,
+        command.program,
+        command.args,
+        workspace.to_path_buf(),
+        grant,
+    )
+    .map_err(anyhow::Error::new)
+    .context("native command was denied by capability policy")?;
+    let events = broker
+        .submit_native_streaming(request)
+        .map_err(anyhow::Error::new)
+        .context("failed to submit native command")?;
+
+    loop {
+        match events.recv().context("native session event channel closed")? {
+            SessionEvent::PendingApproval { .. } => {
+                broker
+                    .approve(session_id)
+                    .map_err(anyhow::Error::new)
+                    .context("failed to approve native command")?;
+            }
+            SessionEvent::Started => {}
+            SessionEvent::Output { bytes, .. } => {
+                if !write_bytes(stdout, &bytes)? {
+                    let _ = broker.cancel(session_id);
+                    break;
+                }
+            }
+            SessionEvent::Exited { code } => {
+                if !write_line(stdout, &format!("native process exited with code {code:?}"))? {
+                    break;
+                }
+                break;
+            }
+            SessionEvent::Cancelled => {
+                if !write_line(stdout, "native process cancelled")? {
+                    break;
+                }
+                break;
+            }
+            SessionEvent::Denied => {
+                if !write_line(stdout, "native process denied")? {
+                    break;
+                }
+                break;
+            }
+            SessionEvent::Unsupported => {
+                if !write_line(stdout, "native execution unsupported on this host")? {
+                    break;
+                }
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Handle one trimmed input line, returning the [`Outcome`] for the caller to act on.
 ///
 /// Kept free of I/O so it can be unit-tested directly.
@@ -188,14 +358,14 @@ pub fn handle_line(line: &str) -> Outcome {
         "version" => Outcome::Reply(format!("ferrous {}", shared::VERSION)),
         "exit" | "quit" => Outcome::Exit,
         other => Outcome::Reply(format!(
-            "`{other}`: unsupported; use `run-wasi <component>` for explicit WASI execution"
+            "`{other}`: unsupported; use `run-wasi <component>` or `run-native --allow -- <program> [args]`"
         )),
     }
 }
 
 /// The help text printed by `help`.
 fn help_text() -> &'static str {
-    "Available commands:\n  help                         show this help\n  version                      print the version\n  run-wasi <component> [args]  run an explicitly selected WASI component\n  exit                         quit the shell\n\nNative host commands are not enabled in this CLI path."
+    "Available commands:\n  help                                  show this help\n  version                               print the version\n  run-wasi <component> [args]           run an explicitly selected WASI component\n  run-native --allow -- <program> [args] run an approved native PTY command\n  exit                                  quit the shell"
 }
 
 #[cfg(test)]
@@ -266,10 +436,8 @@ mod tests {
 
     #[test]
     fn run_native_preserves_quoted_metacharacters_as_one_argument() {
-        let parsed = parse_native_command(
-            "run-native --allow -- sh -lc 'echo hi > /tmp/pwned'",
-        )
-        .expect("native command parses");
+        let parsed = parse_native_command("run-native --allow -- sh -lc 'echo hi > /tmp/pwned'")
+            .expect("native command parses");
         assert_eq!(parsed.program, "sh");
         assert_eq!(parsed.args, ["-lc", "echo hi > /tmp/pwned"]);
     }
