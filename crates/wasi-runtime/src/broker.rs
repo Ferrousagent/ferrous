@@ -1163,6 +1163,7 @@ mod tests {
             )
     }
 
+    #[cfg(unix)]
     fn native_grant() -> CapabilityGrant {
         let root = std::env::temp_dir().join(format!(
             "ferrous-native-broker-workspace-{}",
@@ -1174,6 +1175,7 @@ mod tests {
             .allow_native_execution()
     }
 
+    #[cfg(unix)]
     fn native_request(id: u64, program: &str, args: &[&str]) -> CommandRequest {
         let grant = native_grant();
         let cwd = grant
@@ -1772,6 +1774,7 @@ mod tests {
         panic!("a never reported cancellation");
     }
 
+    #[cfg(unix)]
     #[test]
     fn native_submission_requires_approval_then_streams_output() {
         let broker = ActionBroker::new().expect("broker");
@@ -1811,6 +1814,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn send_input_reaches_a_running_native_session() {
         let broker = ActionBroker::new().expect("broker");
@@ -1887,6 +1891,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn denied_native_request_never_starts() {
         let broker = ActionBroker::new().expect("broker");
@@ -1913,6 +1918,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn native_cancel_reports_cancelled_and_releases_the_session() {
         let broker = ActionBroker::new().expect("broker");

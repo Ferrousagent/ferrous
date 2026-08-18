@@ -435,6 +435,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn only_allowlisted_environment_reaches_the_child() {
         let grant = workspace_grant()

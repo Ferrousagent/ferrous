@@ -16,10 +16,15 @@ concurrency:
 
 jobs:
   check:
-    name: fmt + clippy + tests + docs + benches
-    runs-on: ubuntu-latest
+    name: fmt + clippy + tests + docs + benches (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain (pinned by rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
@@ -51,7 +56,7 @@ jobs:
     name: license + advisory checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Check licenses, advisories, bans, sources
         uses: EmbarkStudios/cargo-deny-action@v2
