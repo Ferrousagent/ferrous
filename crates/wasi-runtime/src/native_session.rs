@@ -20,7 +20,7 @@
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use crate::cancel::CancelHandle;
@@ -161,15 +161,25 @@ impl NativeSessionHandle {
         });
 
         // Input: forward keystrokes from the broker channel into the PTY.
+        // Use a bounded receive timeout: the broker intentionally keeps a
+        // cloned sender in its live-session map until `run` returns, so this
+        // thread must observe teardown independently of sender destruction.
         let input_rx = self.input_rx;
+        let input_stop = stop.clone();
         let input = std::thread::spawn(move || {
             let mut writer = match writer {
                 Some(writer) => writer,
                 None => return,
             };
-            while let Ok(bytes) = input_rx.recv() {
-                let _ = writer.write_all(&bytes);
-                let _ = writer.flush();
+            while !input_stop.load(Ordering::SeqCst) {
+                match input_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(bytes) => {
+                        let _ = writer.write_all(&bytes);
+                        let _ = writer.flush();
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
             }
         });
 
