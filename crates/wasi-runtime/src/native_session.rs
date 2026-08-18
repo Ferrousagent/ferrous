@@ -268,12 +268,45 @@ mod tests {
         NativeSessionHandle::new(session, cancel, request.grant.limits(), events).run()
     }
 
+    #[cfg(unix)]
     #[test]
     fn output_budget_stops_a_chatty_process() {
         let limits = ResourceLimits::new(1024, 30).expect("valid limits");
         let request = native_request("/bin/sh", &["-c", "yes x"], limits);
         let result = run_request(&request, CancelHandle::new());
         assert!(matches!(result, Err(NativeError::OutputLimit)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_limit_never_emits_bytes_beyond_the_declared_budget() {
+        let budget = 64;
+        let limits = ResourceLimits::new(budget, 30).expect("valid limits");
+        let request = native_request("/bin/sh", &["-c", "yes x"], limits);
+        let session = NativeBackend::new().spawn(&request).expect("session spawns");
+        let (events, receiver) = mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            NativeSessionHandle::new(
+                session,
+                CancelHandle::new(),
+                request.grant.limits(),
+                events,
+            )
+            .run()
+        });
+
+        let mut emitted = 0usize;
+        while let Ok(event) = receiver.recv_timeout(Duration::from_secs(5)) {
+            if let SessionEvent::Output { bytes, .. } = event {
+                emitted = emitted.saturating_add(bytes.len());
+            }
+        }
+        let result = runner.join().expect("session thread joins");
+        assert!(matches!(result, Err(NativeError::OutputLimit)));
+        assert!(
+            emitted <= budget,
+            "output events emitted {emitted} bytes for a {budget}-byte budget"
+        );
     }
 
     #[cfg(unix)]
