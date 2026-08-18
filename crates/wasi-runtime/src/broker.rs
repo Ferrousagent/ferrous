@@ -68,6 +68,9 @@ pub enum BrokerError {
     /// The number of outstanding sessions would exceed the broker capacity.
     #[error("broker capacity exceeded; cancel or wait for a running session")]
     QueueFull,
+    /// A live session already owns this identifier.
+    #[error("session id {0} is already live")]
+    DuplicateSession(u64),
     /// The broker capacity must be greater than zero.
     #[error("broker capacity must be greater than zero")]
     InvalidCapacity,
@@ -378,6 +381,9 @@ impl ActionBroker {
             .handles
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        if handles.contains_key(&id) {
+            return Err(BrokerError::DuplicateSession(id));
+        }
         if handles.len() >= self.capacity {
             return Err(BrokerError::QueueFull);
         }
