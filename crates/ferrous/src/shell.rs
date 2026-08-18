@@ -8,10 +8,10 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use wasi_runtime::WasiRuntime;
 use wasi_runtime::broker::ActionBroker;
 use wasi_runtime::capability::{CapabilityGrant, FilesystemAccess};
 use wasi_runtime::command::{Actor, CommandRequest, ExecutionMode, SessionEvent};
-use wasi_runtime::WasiRuntime;
 
 /// The result of handling a single built-in shell line.
 #[derive(Debug, PartialEq, Eq)]
@@ -305,7 +305,10 @@ fn run_native_command(
         .context("failed to submit native command")?;
 
     loop {
-        match events.recv().context("native session event channel closed")? {
+        match events
+            .recv()
+            .context("native session event channel closed")?
+        {
             SessionEvent::PendingApproval { .. } => {
                 broker
                     .approve(session_id)
