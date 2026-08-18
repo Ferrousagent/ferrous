@@ -1414,6 +1414,29 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_live_session_id_is_rejected_without_replacing_the_first_job() {
+        let broker = ActionBroker::new().expect("broker");
+        let (component_a, request_a) =
+            request(&broker, 41, "spin-a", SPIN_WAT, grant(60, 4_000_000_000));
+        let (component_b, request_b) =
+            request(&broker, 41, "hello-b", HELLO_WAT, grant(30, 1_000_000));
+        let receiver_a = broker.submit(component_a, request_a).expect("first fits");
+
+        assert!(matches!(
+            broker.submit(component_b, request_b),
+            Err(BrokerError::DuplicateSession(41))
+        ));
+
+        broker.cancel(41).expect("original session remains cancellable");
+        assert!(matches!(
+            receiver_a
+                .recv_timeout(Duration::from_secs(5))
+                .expect("original session reports cancellation"),
+            BrokerOutcome::Cancelled
+        ));
+    }
+
+    #[test]
     fn hello_runs_with_unlimited_fuel() {
         let broker = ActionBroker::new().expect("broker");
         let (component, request) = request(
