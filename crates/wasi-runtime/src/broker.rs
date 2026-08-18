@@ -26,7 +26,7 @@ use crate::cancel::CancelHandle;
 use crate::command::{
     ApprovalReason, CommandError, CommandRequest, ExecutionMode, SessionEvent, SessionState,
 };
-use crate::native::{NativeBackend, NativeError};
+use crate::native::{NativeBackend, NativeError, NativeOutput};
 use crate::native_session::NativeSessionHandle;
 use crate::policy::{Risk, classify_risk};
 use crate::{RuntimeError, WasiOutput, WasiRuntime};
@@ -97,6 +97,8 @@ pub enum BrokerOutcome {
     Denied(CommandError),
     /// The WASI backend failed; the guest may have been interrupted by a limit.
     Failed(RuntimeError),
+    /// A native process completed and its merged PTY output is available.
+    NativeCompleted(NativeOutput),
     /// The native backend failed before or during a PTY session.
     NativeFailed(NativeError),
 }
@@ -870,6 +872,9 @@ fn execute(
             BrokerOutcome::Cancelled => AuditOutcome::Cancelled,
             BrokerOutcome::Denied(_) => AuditOutcome::Denied,
             BrokerOutcome::Failed(_) | BrokerOutcome::NativeFailed(_) => AuditOutcome::Failed,
+            BrokerOutcome::NativeCompleted(output) => AuditOutcome::Completed {
+                exit_code: i32::try_from(output.exit_code).unwrap_or(i32::MAX),
+            },
         };
         if let JobSink::Outcome(result_tx) = &job.sink {
             let _ = result_tx.send(outcome);
@@ -953,7 +958,7 @@ fn execute_native(state: &Arc<BrokerState>, job: &mut Job, cancel: &CancelHandle
             let exit_code = i32::try_from(output.exit_code).unwrap_or(i32::MAX);
             match &job.sink {
                 JobSink::Outcome(sender) => {
-                    let _ = sender.send(BrokerOutcome::Completed(output));
+                    let _ = sender.send(BrokerOutcome::NativeCompleted(output));
                 }
                 JobSink::Events(sender) => {
                     let _ = job.session.accept(SessionEvent::Exited {
