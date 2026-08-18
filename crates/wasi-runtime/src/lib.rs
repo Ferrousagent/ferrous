@@ -26,7 +26,7 @@ use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
 use crate::cancel::CancelHandle;
 use crate::capability::FilesystemAccess;
 use crate::command::{CommandError, CommandRequest, ExecutionMode, SessionEvent, Stream};
-use crate::pipe::StreamOutputPipe;
+use crate::pipe::{cap_to_remaining, StreamOutputPipe};
 
 /// Errors produced while creating the runtime or admitting a component.
 #[derive(Debug, Error)]
@@ -213,32 +213,49 @@ impl WasiRuntime {
             let mut last_tick = std::time::Instant::now();
             let mut total_stdout = Vec::new();
             let mut total_stderr = Vec::new();
+            // Combined remaining budget. Every chunk is capped to this *before*
+            // emission, so a guest splitting output across stdout+stderr can
+            // never push more than the declared budget into the event stream.
+            let mut remaining = budget;
             let mut budget_closed = false;
             loop {
                 let (out_bytes, out_eof) = reader_stdout.wait_and_drain(Duration::from_millis(50));
-                if !out_bytes.is_empty() {
-                    total_stdout.extend_from_slice(&out_bytes);
-                    let _ = events_tx.send(SessionEvent::Output {
-                        stream: Stream::Stdout,
-                        bytes: out_bytes,
-                    });
+                if !out_bytes.is_empty() && !budget_closed {
+                    let (allowed, exhausted) = cap_to_remaining(out_bytes.len(), remaining);
+                    let emit = &out_bytes[..allowed];
+                    total_stdout.extend_from_slice(emit);
+                    if allowed > 0 {
+                        let _ = events_tx.send(SessionEvent::Output {
+                            stream: Stream::Stdout,
+                            bytes: emit.to_vec(),
+                        });
+                        remaining -= allowed;
+                    }
+                    if exhausted {
+                        budget_closed = true;
+                    }
                 }
                 let (err_bytes, err_eof) = reader_stderr.wait_and_drain(Duration::from_millis(50));
-                if !err_bytes.is_empty() {
-                    total_stderr.extend_from_slice(&err_bytes);
-                    let _ = events_tx.send(SessionEvent::Output {
-                        stream: Stream::Stderr,
-                        bytes: err_bytes,
-                    });
+                if !err_bytes.is_empty() && !budget_closed {
+                    let (allowed, exhausted) = cap_to_remaining(err_bytes.len(), remaining);
+                    let emit = &err_bytes[..allowed];
+                    total_stderr.extend_from_slice(emit);
+                    if allowed > 0 {
+                        let _ = events_tx.send(SessionEvent::Output {
+                            stream: Stream::Stderr,
+                            bytes: emit.to_vec(),
+                        });
+                        remaining -= allowed;
+                    }
+                    if exhausted {
+                        budget_closed = true;
+                    }
                 }
-                // The declared output budget is *combined* across streams: cut
-                // the guest off once stdout+stderr exceed it, so a guest that
-                // splits its output cannot write 2x the budget. Each pipe alone
-                // also traps at `budget`, but the combined cap is authoritative.
-                if !budget_closed && total_stdout.len() + total_stderr.len() > budget {
+                // Cut the guest off once the combined budget is exhausted so
+                // further writes trap instead of buffering past the cap.
+                if budget_closed {
                     reader_stdout.close();
                     reader_stderr.close();
-                    budget_closed = true;
                 }
                 if reader_cancel.is_cancelled() {
                     // Burst past the deadline so the guest traps at its next

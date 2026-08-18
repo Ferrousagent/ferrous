@@ -18,6 +18,17 @@ use bytes::Bytes;
 use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
 use wasmtime_wasi::p2::{OutputStream, Pollable, StreamError};
 
+/// Cap a chunk to the remaining combined output budget.
+///
+/// Returns the number of bytes that may be emitted and whether the budget
+/// is now exhausted. The streaming reader uses this *before* emitting so a
+/// guest splitting its output across streams can never push more than the
+/// declared budget into the event stream.
+pub fn cap_to_remaining(chunk_len: usize, remaining: usize) -> (usize, bool) {
+    let allowed = chunk_len.min(remaining);
+    (allowed, allowed < chunk_len)
+}
+
 /// A bounded output pipe whose reader can drain bytes incrementally.
 #[derive(Clone)]
 pub struct StreamOutputPipe(Arc<StreamOutputPipeInner>);
@@ -284,6 +295,31 @@ mod tests {
             matches!(result, Poll::Ready(Err(_))),
             "full pipe must error, got {result:?}"
         );
+    }
+
+    #[test]
+    fn cap_to_remaining_never_allows_over_budget_emission() {
+        // Red-team: a guest splitting output across stdout+stderr must never
+        // push the combined event stream past the declared budget. Each chunk
+        // is capped to the remaining budget *before* emission.
+        let budget = 64usize;
+        let mut remaining = budget;
+
+        // First chunk fits exactly.
+        let (allowed, exhausted) = cap_to_remaining(64, remaining);
+        assert_eq!(allowed, 64);
+        assert!(!exhausted, "exact fill does not overrun");
+        remaining -= allowed;
+
+        // Any further byte exceeds the combined budget and must be cut off.
+        let (allowed, exhausted) = cap_to_remaining(1, remaining);
+        assert_eq!(allowed, 0, "no bytes may be emitted past the budget");
+        assert!(exhausted);
+
+        // A chunk larger than the whole budget is truncated to the budget.
+        let (allowed, exhausted) = cap_to_remaining(8_192, 64);
+        assert_eq!(allowed, 64);
+        assert!(exhausted, "truncation counts as exhausting the budget");
     }
 
     #[test]

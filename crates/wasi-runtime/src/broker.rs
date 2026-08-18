@@ -1755,6 +1755,14 @@ mod tests {
         assert_eq!(winners.len(), 1, "exactly one submission must win");
 
         let receiver = winners.pop().expect("one winner");
+        // The winner parks for approval (write grant), so the caller must
+        // consume the park notification before the terminal outcome arrives.
+        assert!(matches!(
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("winner parks for approval"),
+            BrokerOutcome::PendingApproval { .. }
+        ));
         broker
             .cancel(id)
             .expect("the winning session stays cancellable");
