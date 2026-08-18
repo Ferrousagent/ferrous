@@ -241,6 +241,7 @@ mod tests {
     use crate::command::{Actor, CommandRequest, ExecutionMode};
     use crate::native::NativeBackend;
 
+    #[cfg(unix)]
     fn native_request(program: &str, args: &[&str], limits: ResourceLimits) -> CommandRequest {
         let root = std::env::temp_dir().join(format!(
             "ferrous-native-session-test-{}",
@@ -263,6 +264,7 @@ mod tests {
         .expect("valid native request")
     }
 
+    #[cfg(unix)]
     fn run_request(
         request: &CommandRequest,
         cancel: CancelHandle,

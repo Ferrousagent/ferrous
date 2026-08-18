@@ -273,6 +273,7 @@ mod tests {
         std::env::temp_dir().join(format!("ferrous-native-{name}-{}", std::process::id()))
     }
 
+    #[cfg(unix)]
     fn native_request(program: &str, args: &[&str], grant: CapabilityGrant) -> CommandRequest {
         let cwd = grant
             .filesystem_grants()
@@ -472,6 +473,7 @@ mod tests {
 
     /// Poll `try_exit_status` until the child is reaped or `deadline_ms`
     /// elapses. The PTY can report EOF a moment before the child is reaped.
+    #[cfg(unix)]
     fn poll_exit(
         session: &mut NativeSession,
         deadline_ms: u64,
