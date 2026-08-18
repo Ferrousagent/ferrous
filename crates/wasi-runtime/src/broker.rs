@@ -1717,18 +1717,28 @@ mod tests {
 
     #[test]
     fn concurrent_duplicate_id_submissions_allow_exactly_one_winner() {
-        // Red-team: N threads submit the same live session id simultaneously.
-        // Exactly one submission may win; every other must be rejected as a
-        // duplicate, and the winner must remain cancellable and reach exactly
-        // one terminal outcome.
+        // Red-team: N threads submit the same session id simultaneously while
+        // that id is still live. Exactly one submission may win; every other
+        // must be rejected as a duplicate, and the winner must remain
+        // cancellable and reach exactly one terminal outcome.
+        //
+        // The winner uses a read-write grant so it parks for approval instead
+        // of completing instantly: the id must stay reserved for the whole
+        // flood, or a second submission could legitimately win once the first
+        // session was already released.
         let broker = Arc::new(ActionBroker::new().expect("broker"));
         let id = 77;
+        let barrier = Arc::new(std::sync::Barrier::new(8));
         let threads: Vec<_> = (0..8)
             .map(|_| {
                 let broker = broker.clone();
+                let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     let (component, request) =
-                        request(&broker, id, "hello", HELLO_WAT, grant(30, 1_000_000));
+                        request(&broker, id, "hello", HELLO_WAT, write_grant(30, 1_000_000));
+                    // Race the submissions together so every contender checks
+                    // the live id while the eventual winner still holds it.
+                    barrier.wait();
                     broker.submit(component, request)
                 })
             })

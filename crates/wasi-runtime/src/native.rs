@@ -450,7 +450,7 @@ mod tests {
         let request = native_request("env", &[], grant);
         let provider = |name: &str| match name {
             "PATH" => Some("/usr/bin:/bin".to_owned()),
-            name if name == "LEAKY_SENTINEL" => Some(sentinel.clone()),
+            "LEAKY_SENTINEL" => Some(sentinel.clone()),
             _ => None,
         };
         let session = NativeBackend::new()
