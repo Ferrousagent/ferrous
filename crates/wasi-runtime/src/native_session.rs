@@ -228,3 +228,105 @@ impl NativeSessionHandle {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::capability::{CapabilityGrant, FilesystemAccess, ResourceLimits};
+    use crate::command::{Actor, CommandRequest, ExecutionMode};
+    use crate::native::NativeBackend;
+
+    fn native_request(program: &str, args: &[&str], limits: ResourceLimits) -> CommandRequest {
+        let root = std::env::temp_dir().join(format!(
+            "ferrous-native-session-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let grant = CapabilityGrant::workspace(&root, FilesystemAccess::ReadWrite)
+            .expect("absolute workspace")
+            .allow_native_execution()
+            .with_limits(limits);
+        CommandRequest::new(
+            1,
+            Actor::Agent,
+            ExecutionMode::Native,
+            program,
+            args.iter().copied(),
+            root,
+            grant,
+        )
+        .expect("valid native request")
+    }
+
+    fn run_request(
+        request: &CommandRequest,
+        cancel: CancelHandle,
+    ) -> Result<NativeOutput, NativeError> {
+        let session = NativeBackend::new().spawn(request)?;
+        let (events, _receiver) = mpsc::channel();
+        NativeSessionHandle::new(session, cancel, request.grant.limits(), events).run()
+    }
+
+    #[test]
+    fn output_budget_stops_a_chatty_process() {
+        let limits = ResourceLimits::new(1024, 30).expect("valid limits");
+        let request = native_request("/bin/sh", &["-c", "yes x"], limits);
+        let result = run_request(&request, CancelHandle::new());
+        assert!(matches!(result, Err(NativeError::OutputLimit)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_kills_the_native_process_tree() {
+        let limits = ResourceLimits::new(4096, 30).expect("valid limits");
+        let request = native_request(
+            "/bin/sh",
+            &["-c", "sleep 300 & child=$!; printf '%s\\n' \"$child\"; wait"],
+            limits,
+        );
+        let cancel = CancelHandle::new();
+        let runner_cancel = cancel.clone();
+        let session = NativeBackend::new().spawn(&request).expect("session spawns");
+        let (events, receiver) = mpsc::channel();
+        let handle = NativeSessionHandle::new(
+            session,
+            runner_cancel,
+            request.grant.limits(),
+            events,
+        );
+        let runner = std::thread::spawn(move || handle.run());
+
+        let mut child_pid = None;
+        for _ in 0..20 {
+            if let Ok(SessionEvent::Output { bytes, .. }) =
+                receiver.recv_timeout(Duration::from_millis(250))
+            {
+                let text = String::from_utf8_lossy(&bytes);
+                child_pid = text
+                    .split_whitespace()
+                    .find_map(|value| value.parse::<u32>().ok());
+                if child_pid.is_some() {
+                    break;
+                }
+            }
+        }
+        cancel.cancel();
+        let result = runner.join().expect("session thread joins");
+        assert!(matches!(result, Err(NativeError::Cancelled)));
+        let pid = child_pid.expect("shell reported its grandchild pid");
+
+        for _ in 0..20 {
+            let still_alive = std::process::Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .expect("kill is available")
+                .success();
+            if !still_alive {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("cancelled native process left grandchild pid {pid} alive");
+    }
+}
