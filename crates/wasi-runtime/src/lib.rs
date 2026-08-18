@@ -26,7 +26,7 @@ use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
 use crate::cancel::CancelHandle;
 use crate::capability::FilesystemAccess;
 use crate::command::{CommandError, CommandRequest, ExecutionMode, SessionEvent, Stream};
-use crate::pipe::{cap_to_remaining, StreamOutputPipe};
+use crate::pipe::{StreamOutputPipe, cap_to_remaining};
 
 /// Errors produced while creating the runtime or admitting a component.
 #[derive(Debug, Error)]
