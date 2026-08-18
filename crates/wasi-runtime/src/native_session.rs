@@ -137,25 +137,29 @@ impl NativeSessionHandle {
                 if reader_stop.load(Ordering::SeqCst) {
                     return;
                 }
-                {
+                let (accepted, overflowed) = {
                     let mut captured = reader_captured
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    captured.extend_from_slice(chunk);
-                    let total = captured.len();
-                    if !exceeded && total > budget {
-                        exceeded = true;
-                        let _ = killer.clone_killer().kill();
-                        *reader_reason
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(NativeStop::OutputLimit);
-                    }
+                    let remaining = budget.saturating_sub(captured.len());
+                    let accepted = chunk.len().min(remaining);
+                    captured.extend_from_slice(&chunk[..accepted]);
+                    (accepted, chunk.len() > accepted)
+                };
+                if overflowed && !exceeded {
+                    exceeded = true;
+                    let _ = killer.clone_killer().kill();
+                    *reader_reason
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(NativeStop::OutputLimit);
                 }
-                let _ = reader_sink.send(SessionEvent::Output {
-                    stream: Stream::Stdout,
-                    bytes: chunk.to_vec(),
-                });
+                if accepted > 0 {
+                    let _ = reader_sink.send(SessionEvent::Output {
+                        stream: Stream::Stdout,
+                        bytes: chunk[..accepted].to_vec(),
+                    });
+                }
             });
             let _ = exceeded;
         });
