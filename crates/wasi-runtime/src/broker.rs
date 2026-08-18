@@ -1427,7 +1427,9 @@ mod tests {
             Err(BrokerError::DuplicateSession(41))
         ));
 
-        broker.cancel(41).expect("original session remains cancellable");
+        broker
+            .cancel(41)
+            .expect("original session remains cancellable");
         assert!(matches!(
             receiver_a
                 .recv_timeout(Duration::from_secs(5))
