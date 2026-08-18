@@ -1631,6 +1631,135 @@ mod tests {
     }
 
     #[test]
+    fn approve_cancel_race_yields_exactly_one_terminal_outcome() {
+        // Red-team: a caller that races approve() against cancel()/deny() on
+        // the same parked session must never observe two terminal outcomes or
+        // a ghost run. The session must be released either way.
+        let broker = ActionBroker::new().expect("broker");
+        for iteration in 1..=30u64 {
+            let id = 10_000 + iteration;
+            let (component, request) =
+                request(&broker, id, "hello", HELLO_WAT, write_grant(30, 1_000_000));
+            let receiver = broker.submit(component, request).expect("submitted");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("pending approval"),
+                BrokerOutcome::PendingApproval { .. }
+            ));
+
+            // Fire both decisions at the same moment so they contend on the
+            // pending lock; whichever wins, exactly one terminal must arrive.
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let (ok_a, ok_c) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+            let (bar_a, bar_c) = (barrier.clone(), barrier.clone());
+            let (ok_a2, ok_c2) = (ok_a.clone(), ok_c.clone());
+            std::thread::spawn(move || {
+                bar_a.wait();
+                ok_a2.store(broker.approve(id).is_ok(), Ordering::SeqCst);
+            });
+            std::thread::spawn(move || {
+                bar_c.wait();
+                ok_c2.store(broker.cancel(id).is_ok(), Ordering::SeqCst);
+            });
+            barrier.wait();
+
+            let mut terminals = 0usize;
+            let mut saw_denied = false;
+            loop {
+                match receiver.recv_timeout(Duration::from_millis(300)) {
+                    Ok(BrokerOutcome::PendingApproval { .. }) => {}
+                    Ok(BrokerOutcome::Denied(_)) => {
+                        saw_denied = true;
+                        terminals += 1;
+                    }
+                    Ok(BrokerOutcome::Cancelled) => terminals += 1,
+                    Ok(BrokerOutcome::Completed(_)) => terminals += 1,
+                    Ok(other) => panic!("unexpected outcome {other:?} in iteration {iteration}"),
+                    Err(_) => break,
+                }
+            }
+            assert_eq!(
+                terminals, 1,
+                "iteration {iteration}: exactly one terminal outcome expected, got {terminals}"
+            );
+            assert!(
+                ok_a.load(Ordering::SeqCst) || ok_c.load(Ordering::SeqCst),
+                "iteration {iteration}: at least one of approve/cancel must succeed"
+            );
+            assert!(
+                !(saw_denied && terminals > 1),
+                "iteration {iteration}: a denial followed by another terminal is a double-terminal"
+            );
+
+            for _ in 0..50 {
+                if broker.outstanding_sessions() == 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(
+                broker.outstanding_sessions(),
+                0,
+                "iteration {iteration}: the raced session must be released"
+            );
+            let trail = broker.audit_trail();
+            assert!(
+                trail.iter().any(|entry| entry.id == id),
+                "iteration {iteration}: the raced session must be audited"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_duplicate_id_submissions_allow_exactly_one_winner() {
+        // Red-team: N threads submit the same live session id simultaneously.
+        // Exactly one submission may win; every other must be rejected as a
+        // duplicate, and the winner must remain cancellable and reach exactly
+        // one terminal outcome.
+        let broker = Arc::new(ActionBroker::new().expect("broker"));
+        let id = 77;
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let broker = broker.clone();
+                std::thread::spawn(move || {
+                    let (component, request) =
+                        request(&broker, id, "hello", HELLO_WAT, grant(30, 1_000_000));
+                    broker.submit(component, request)
+                })
+            })
+            .collect();
+
+        let mut winners = Vec::new();
+        for thread in threads {
+            match thread.join().expect("submitter joins") {
+                Ok(receiver) => winners.push(receiver),
+                Err(BrokerError::DuplicateSession(77)) => {}
+                Err(other) => panic!("unexpected duplicate-id result: {other:?}"),
+            }
+        }
+        assert_eq!(winners.len(), 1, "exactly one submission must win");
+
+        let receiver = winners.pop().expect("one winner");
+        broker.cancel(id).expect("the winning session stays cancellable");
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("winner reports a terminal outcome");
+        assert!(matches!(outcome, BrokerOutcome::Cancelled));
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the winner must emit exactly one terminal outcome"
+        );
+        for _ in 0..50 {
+            if broker.outstanding_sessions() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(broker.outstanding_sessions(), 0);
+    }
+
+    #[test]
     fn approve_of_non_pending_session_errors() {
         let broker = ActionBroker::new().expect("broker");
         assert!(matches!(

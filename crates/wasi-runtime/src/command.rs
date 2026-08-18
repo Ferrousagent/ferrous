@@ -281,6 +281,87 @@ mod tests {
         std::env::temp_dir().join("ferrous-test-workspace")
     }
 
+    /// Deterministic xorshift64 so the fuzz sequence is reproducible in CI
+    /// without adding a property-testing dependency.
+    fn xorshift64(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn fuzzed_event_sequences_never_break_state_machine_invariants() {
+        // Red-team: feed a deterministic PRNG stream of arbitrary events into
+        // the session state machine. No input may panic it, and every accepted
+        // event must keep the invariants: output bytes never exceed the budget,
+        // terminal states reject everything, and the session cannot output
+        // before starting or after finishing.
+        let limits = ResourceLimits::new(1024, 30).expect("valid limits");
+        let mut state = SessionState::new(0xDEAD_BEEF, limits);
+        let mut rng = 0x9E3779B97F4A7C15u64;
+
+        let events = [
+            SessionEvent::Started,
+            SessionEvent::PendingApproval {
+                reason: ApprovalReason::NativeExecution,
+            },
+            SessionEvent::Output {
+                stream: Stream::Stdout,
+                bytes: vec![0x41; 128],
+            },
+            SessionEvent::Output {
+                stream: Stream::Stderr,
+                bytes: vec![0x42; 512],
+            },
+            SessionEvent::Exited { code: Some(0) },
+            SessionEvent::Cancelled,
+            SessionEvent::Denied,
+            SessionEvent::Unsupported,
+        ];
+
+        for _ in 0..20_000 {
+            let index = (xorshift64(&mut rng) as usize) % events.len();
+            let event = events[index].clone();
+            // Event construction is a no-op; `accept` must never panic and
+            // must keep the output accounting honest on every path.
+            let _ = state.accept(event);
+            assert!(
+                state.output_bytes() <= limits.max_output_bytes(),
+                "output accounting exceeded the declared budget"
+            );
+        }
+
+        // After a terminal event the machine must be closed to everything.
+        let mut finished = SessionState::new(1, limits);
+        finished.accept(SessionEvent::Started).expect("starts");
+        finished
+            .accept(SessionEvent::Exited { code: Some(0) })
+            .expect("exits");
+        for event in events.iter().cloned() {
+            assert!(
+                finished.accept(event).is_err(),
+                "a finished session must reject every event, including {event:?}"
+            );
+        }
+
+        // Output before start and after a denial is refused.
+        let mut early = SessionState::new(2, limits);
+        assert!(early
+            .accept(SessionEvent::Output {
+                stream: Stream::Stdout,
+                bytes: b"x".to_vec(),
+            })
+            .is_err());
+        early.accept(SessionEvent::Denied).expect("denied");
+        assert!(early
+            .accept(SessionEvent::Output {
+                stream: Stream::Stdout,
+                bytes: b"x".to_vec(),
+            })
+            .is_err());
+    }
+
     #[test]
     fn native_request_with_workspace_and_grant_is_valid() {
         let workspace = absolute_test_workspace();

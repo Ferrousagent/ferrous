@@ -438,6 +438,44 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn unallowlisted_sentinel_secret_never_reaches_the_child() {
+        // Red-team: the "host" environment (the provider) carries a secret
+        // sentinel that the grant does NOT allowlist. A real child process
+        // must never see it, even when the same provider also holds an
+        // allowlisted variable the child is entitled to.
+        let sentinel = format!("ferrous-secret-{}", std::process::id());
+        let grant = workspace_grant()
+            .allow_environment("PATH")
+            .expect("valid name");
+        let request = native_request("env", &[], grant);
+        let provider = |name: &str| match name {
+            "PATH" => Some("/usr/bin:/bin".to_owned()),
+            name if name == "LEAKY_SENTINEL" => Some(sentinel.clone()),
+            _ => None,
+        };
+        let session = NativeBackend::new()
+            .spawn_with_env(&request, &provider)
+            .expect("spawns");
+        let mut output = Vec::new();
+        let mut reader = session.try_clone_reader().expect("reader");
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = reader.read(&mut buffer).expect("read");
+            if count == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..count]);
+        }
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            !text.contains(&sentinel),
+            "sentinel secret leaked into the child environment: {text}"
+        );
+        assert!(text.contains("PATH=/usr/bin:/bin"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn only_allowlisted_environment_reaches_the_child() {
         let grant = workspace_grant()
             .allow_environment("ALLOWED_VAR")
