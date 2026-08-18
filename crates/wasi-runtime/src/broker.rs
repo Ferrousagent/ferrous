@@ -1658,15 +1658,20 @@ mod tests {
             let (bar_a, bar_c) = (barrier.clone(), barrier.clone());
             let (ok_a2, ok_c2) = (ok_a.clone(), ok_c.clone());
             let (broker_a, broker_c) = (broker.clone(), broker.clone());
-            std::thread::spawn(move || {
+            let thread_a = std::thread::spawn(move || {
                 bar_a.wait();
                 ok_a2.store(broker_a.approve(id).is_ok(), Ordering::SeqCst);
             });
-            std::thread::spawn(move || {
+            let thread_c = std::thread::spawn(move || {
                 bar_c.wait();
                 ok_c2.store(broker_c.cancel(id).is_ok(), Ordering::SeqCst);
             });
             barrier.wait();
+            // Join before reading the results: the barrier only synchronizes
+            // the start, not the stores above, so without a join the main
+            // thread could observe both flags before either decision landed.
+            thread_a.join().expect("approver joins");
+            thread_c.join().expect("canceller joins");
 
             let mut terminals = 0usize;
             let mut saw_denied = false;
