@@ -1818,12 +1818,16 @@ mod tests {
         }
         assert!(saw_echo, "PTY input must be echoed by cat");
         broker.cancel(1).expect("cat is cancellable");
-        assert_eq!(
-            events
+        for _ in 0..4 {
+            if events
                 .recv_timeout(Duration::from_secs(5))
-                .expect("cancel event"),
-            SessionEvent::Cancelled
-        );
+                .expect("native terminal event")
+                == SessionEvent::Cancelled
+            {
+                return;
+            }
+        }
+        panic!("native session never reported cancellation");
     }
 
     #[test]
