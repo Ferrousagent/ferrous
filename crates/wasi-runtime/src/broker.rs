@@ -1635,7 +1635,7 @@ mod tests {
         // Red-team: a caller that races approve() against cancel()/deny() on
         // the same parked session must never observe two terminal outcomes or
         // a ghost run. The session must be released either way.
-        let broker = ActionBroker::new().expect("broker");
+        let broker = Arc::new(ActionBroker::new().expect("broker"));
         for iteration in 1..=30u64 {
             let id = 10_000 + iteration;
             let (component, request) =
@@ -1657,13 +1657,14 @@ mod tests {
             );
             let (bar_a, bar_c) = (barrier.clone(), barrier.clone());
             let (ok_a2, ok_c2) = (ok_a.clone(), ok_c.clone());
+            let (broker_a, broker_c) = (broker.clone(), broker.clone());
             std::thread::spawn(move || {
                 bar_a.wait();
-                ok_a2.store(broker.approve(id).is_ok(), Ordering::SeqCst);
+                ok_a2.store(broker_a.approve(id).is_ok(), Ordering::SeqCst);
             });
             std::thread::spawn(move || {
                 bar_c.wait();
-                ok_c2.store(broker.cancel(id).is_ok(), Ordering::SeqCst);
+                ok_c2.store(broker_c.cancel(id).is_ok(), Ordering::SeqCst);
             });
             barrier.wait();
 
