@@ -23,11 +23,11 @@ use thiserror::Error;
 use wasmtime::component::Component;
 
 use crate::cancel::CancelHandle;
-use crate::native::{NativeBackend, NativeError};
-use crate::native_session::NativeSessionHandle;
 use crate::command::{
     ApprovalReason, CommandError, CommandRequest, ExecutionMode, SessionEvent, SessionState,
 };
+use crate::native::{NativeBackend, NativeError};
+use crate::native_session::NativeSessionHandle;
 use crate::policy::{Risk, classify_risk};
 use crate::{RuntimeError, WasiOutput, WasiRuntime};
 
@@ -627,11 +627,7 @@ fn native_worker_loop(queue_rx: mpsc::Receiver<Job>, state: Arc<BrokerState>) {
 
 /// Run one job inside a panic barrier so a guest-triggered host bug cannot
 /// kill the worker (and with it every queued session) silently.
-fn process_job_guarded(
-    runtime: Option<&WasiRuntime>,
-    state: &Arc<BrokerState>,
-    job: Job,
-) {
+fn process_job_guarded(runtime: Option<&WasiRuntime>, state: &Arc<BrokerState>, job: Job) {
     // Snapshot everything the terminal/audit paths need before the panic-prone
     // body runs, so a panic can still report the session instead of orphaning it.
     let id = job.request.id;
@@ -883,11 +879,7 @@ fn execute(
 }
 
 /// Run one native PTY job, registering its input channel only after spawn succeeds.
-fn execute_native(
-    state: &Arc<BrokerState>,
-    job: &mut Job,
-    cancel: &CancelHandle,
-) -> AuditOutcome {
+fn execute_native(state: &Arc<BrokerState>, job: &mut Job, cancel: &CancelHandle) -> AuditOutcome {
     if cancel.is_cancelled() {
         if let JobSink::Outcome(sender) = &job.sink {
             let _ = sender.send(BrokerOutcome::Cancelled);
@@ -1198,7 +1190,7 @@ mod tests {
         wat: &str,
         grant: CapabilityGrant,
     ) -> (Component, CommandRequest) {
-                let bytes = wat::parse_str(wat).expect("valid WAT");
+        let bytes = wat::parse_str(wat).expect("valid WAT");
         let component = broker
             .compile_component(&bytes)
             .expect("component admission");
