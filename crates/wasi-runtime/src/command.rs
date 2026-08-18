@@ -347,19 +347,23 @@ mod tests {
 
         // Output before start and after a denial is refused.
         let mut early = SessionState::new(2, limits);
-        assert!(early
-            .accept(SessionEvent::Output {
-                stream: Stream::Stdout,
-                bytes: b"x".to_vec(),
-            })
-            .is_err());
+        assert!(
+            early
+                .accept(SessionEvent::Output {
+                    stream: Stream::Stdout,
+                    bytes: b"x".to_vec(),
+                })
+                .is_err()
+        );
         early.accept(SessionEvent::Denied).expect("denied");
-        assert!(early
-            .accept(SessionEvent::Output {
-                stream: Stream::Stdout,
-                bytes: b"x".to_vec(),
-            })
-            .is_err());
+        assert!(
+            early
+                .accept(SessionEvent::Output {
+                    stream: Stream::Stdout,
+                    bytes: b"x".to_vec(),
+                })
+                .is_err()
+        );
     }
 
     #[test]

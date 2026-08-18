@@ -1651,7 +1651,10 @@ mod tests {
             // Fire both decisions at the same moment so they contend on the
             // pending lock; whichever wins, exactly one terminal must arrive.
             let barrier = Arc::new(std::sync::Barrier::new(3));
-            let (ok_a, ok_c) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+            let (ok_a, ok_c) = (
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            );
             let (bar_a, bar_c) = (barrier.clone(), barrier.clone());
             let (ok_a2, ok_c2) = (ok_a.clone(), ok_c.clone());
             std::thread::spawn(move || {
@@ -1741,7 +1744,9 @@ mod tests {
         assert_eq!(winners.len(), 1, "exactly one submission must win");
 
         let receiver = winners.pop().expect("one winner");
-        broker.cancel(id).expect("the winning session stays cancellable");
+        broker
+            .cancel(id)
+            .expect("the winning session stays cancellable");
         let outcome = receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("winner reports a terminal outcome");
