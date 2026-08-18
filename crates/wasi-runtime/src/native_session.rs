@@ -282,19 +282,20 @@ mod tests {
         let limits = ResourceLimits::new(4096, 30).expect("valid limits");
         let request = native_request(
             "/bin/sh",
-            &["-c", "sleep 300 & child=$!; printf '%s\\n' \"$child\"; wait"],
+            &[
+                "-c",
+                "sleep 300 & child=$!; printf '%s\\n' \"$child\"; wait",
+            ],
             limits,
         );
         let cancel = CancelHandle::new();
         let runner_cancel = cancel.clone();
-        let session = NativeBackend::new().spawn(&request).expect("session spawns");
+        let session = NativeBackend::new()
+            .spawn(&request)
+            .expect("session spawns");
         let (events, receiver) = mpsc::channel();
-        let handle = NativeSessionHandle::new(
-            session,
-            runner_cancel,
-            request.grant.limits(),
-            events,
-        );
+        let handle =
+            NativeSessionHandle::new(session, runner_cancel, request.grant.limits(), events);
         let runner = std::thread::spawn(move || handle.run());
 
         let mut child_pid = None;
