@@ -401,9 +401,12 @@ mod tests {
     use super::*;
     use crate::capability::{CapabilityGrant, FilesystemAccess};
 
-    fn test_spec(actor: Actor) -> (TerminalSessionSpec, PathBuf) {
+    /// Build an isolated test session. `name` must be unique per test: Rust
+    /// runs tests in parallel threads, and sharing one temp root between two
+    /// tests would race on `remove_dir_all`/`create_dir_all`.
+    fn test_spec(name: &str, actor: Actor) -> (TerminalSessionSpec, PathBuf) {
         let root = std::env::temp_dir().join(format!(
-            "ferrous-session-test-{}-{actor:?}",
+            "ferrous-session-test-{name}-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -423,7 +426,7 @@ mod tests {
 
     #[test]
     fn cd_persists_for_the_next_command_without_touching_the_host_cwd() {
-        let (spec, root) = test_spec(Actor::Human);
+        let (spec, root) = test_spec("cd-persists", Actor::Human);
         let host_cwd = std::env::current_dir().expect("host cwd");
         let mut session = TerminalSession::new(spec).expect("session opens");
 
@@ -443,7 +446,7 @@ mod tests {
 
     #[test]
     fn cd_rejects_parent_escapes() {
-        let (spec, root) = test_spec(Actor::Human);
+        let (spec, root) = test_spec("cd-escapes", Actor::Human);
         let mut session = TerminalSession::new(spec).expect("session opens");
         let outside = root
             .parent()
@@ -459,7 +462,7 @@ mod tests {
 
     #[test]
     fn builtin_mkdir_target_resolves_inside_the_workspace_grant() {
-        let (spec, root) = test_spec(Actor::Human);
+        let (spec, root) = test_spec("mkdir-resolve", Actor::Human);
         let session = TerminalSession::new(spec).expect("session opens");
         let target = session
             .resolve_new_path(&SessionPath::new("newdir").expect("valid path"))
@@ -470,7 +473,7 @@ mod tests {
 
     #[test]
     fn env_overlay_only_accepts_allowlisted_names() {
-        let (spec, _root) = test_spec(Actor::Agent);
+        let (spec, _root) = test_spec("env-overlay", Actor::Agent);
         let mut session = TerminalSession::new(spec).expect("session opens");
         let grant = session.base_grant();
         assert!(!grant.allows_environment("MY_VAR"));
@@ -485,7 +488,7 @@ mod tests {
 
     #[test]
     fn env_never_returns_unallowlisted_host_variables() {
-        let (spec, _root) = test_spec(Actor::Human);
+        let (spec, _root) = test_spec("env-allowlist", Actor::Human);
         let session = TerminalSession::new(spec).expect("session opens");
         let grant = session.base_grant().clone();
         let session_grant = grant.allow_environment("ALLOWED").expect("valid name");
@@ -507,7 +510,7 @@ mod tests {
 
     #[test]
     fn session_close_cancels_all_owned_jobs() {
-        let (spec, _root) = test_spec(Actor::Subagent);
+        let (spec, _root) = test_spec("close-jobs", Actor::Subagent);
         let mut session = TerminalSession::new(spec).expect("session opens");
         let first = session
             .register_job("a".to_owned(), crate::cancel::CancelHandle::new())
@@ -532,7 +535,7 @@ mod tests {
 
     #[test]
     fn job_table_is_bounded() {
-        let (spec, _root) = test_spec(Actor::Skill);
+        let (spec, _root) = test_spec("job-bound", Actor::Skill);
         let mut session = TerminalSession::new(spec).expect("session opens");
         for _ in 0..DEFAULT_MAX_JOBS {
             session
@@ -547,7 +550,7 @@ mod tests {
 
     #[test]
     fn cancel_job_removes_it_and_marks_cancelled() {
-        let (spec, _root) = test_spec(Actor::Human);
+        let (spec, _root) = test_spec("cancel-job", Actor::Human);
         let mut session = TerminalSession::new(spec).expect("session opens");
         let handle = crate::cancel::CancelHandle::new();
         let id = session

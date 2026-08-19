@@ -747,10 +747,12 @@ fn run_pipeline_stage(
             // Builtins run in-process; stdin from the previous stage is
             // consumed only by cat-like builtins (v1: echo-style builtins
             // ignore piped input, matching `echo x | echo y` semantics).
+            let cwd_path = SessionPath::new(".")
+                .map_err(|_| ExecuteError::InvalidPlan("pipeline cwd is not a session path"))?;
             let mut session = TerminalSession::new(TerminalSessionSpec {
                 id: 0,
                 actor,
-                cwd: SessionPath::new(".").expect("valid cwd"),
+                cwd: cwd_path,
                 base_grant: grant.clone(),
                 limits,
             })?;

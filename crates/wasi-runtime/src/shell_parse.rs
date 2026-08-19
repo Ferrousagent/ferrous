@@ -469,10 +469,9 @@ impl Parser {
             }
             stages.push(self.parse_command()?);
         }
-        if stages.len() == 1 {
-            Ok(Statement::Command(stages.pop().expect("one stage")))
-        } else {
-            Ok(Statement::Pipeline(stages))
+        match stages.len() {
+            1 => Ok(Statement::Command(stages.remove(0))),
+            _ => Ok(Statement::Pipeline(stages)),
         }
     }
 
