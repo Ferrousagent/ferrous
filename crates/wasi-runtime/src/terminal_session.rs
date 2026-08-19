@@ -255,7 +255,11 @@ impl TerminalSession {
     ///
     /// Returns [`SessionError::JobTableFull`] when the table is at capacity,
     /// or [`SessionError::Closed`] when the session is closed.
-    pub fn register_job(&mut self, digest_hex: String, cancel: crate::cancel::CancelHandle) -> Result<u64, SessionError> {
+    pub fn register_job(
+        &mut self,
+        digest_hex: String,
+        cancel: crate::cancel::CancelHandle,
+    ) -> Result<u64, SessionError> {
         if self.closed {
             return Err(SessionError::Closed);
         }
@@ -274,10 +278,7 @@ impl TerminalSession {
     ///
     /// Returns [`SessionError::UnknownJob`] if the id is not live.
     pub fn cancel_job(&mut self, id: u64) -> Result<(), SessionError> {
-        let handle = self
-            .jobs
-            .remove(&id)
-            .ok_or(SessionError::UnknownJob(id))?;
+        let handle = self.jobs.remove(&id).ok_or(SessionError::UnknownJob(id))?;
         handle.cancel.cancel();
         Ok(())
     }
@@ -387,10 +388,15 @@ mod tests {
     fn cd_rejects_parent_escapes() {
         let (spec, root) = test_spec(Actor::Human);
         let mut session = TerminalSession::new(spec).expect("session opens");
-        let outside = root.parent().expect("temp dir has a parent").join("ferrous-session-escape");
+        let outside = root
+            .parent()
+            .expect("temp dir has a parent")
+            .join("ferrous-session-escape");
         let _ = std::fs::create_dir_all(&outside);
 
-        let result = session.change_dir(&SessionPath::new("../../ferrous-session-escape").expect("lexically valid"));
+        let result = session.change_dir(
+            &SessionPath::new("../../ferrous-session-escape").expect("lexically valid"),
+        );
         assert!(matches!(result, Err(SessionError::PathDenied(_))));
     }
 

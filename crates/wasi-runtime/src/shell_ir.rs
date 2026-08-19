@@ -538,10 +538,7 @@ mod tests {
         let plan = ShellProgram {
             statements: vec![
                 Statement::Command(spec(Program::Builtin(Builtin::Pwd), &[])),
-                Statement::Command(spec(
-                    Program::External("git".to_owned()),
-                    &["status"],
-                )),
+                Statement::Command(spec(Program::External("git".to_owned()), &["status"])),
             ],
         };
         let first = CommandDigest::of(&plan);

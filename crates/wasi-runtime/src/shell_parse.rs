@@ -309,10 +309,7 @@ impl<'a> Tokenizer<'a> {
 
     fn operator_at(&mut self, characters: &[char]) -> Result<Operator, ParseError> {
         let first = characters[self.position];
-        let second = characters
-            .get(self.position + 1)
-            .copied()
-            .unwrap_or('\0');
+        let second = characters.get(self.position + 1).copied().unwrap_or('\0');
         match (first, second) {
             ('|', '|') => {
                 self.position += 2;
@@ -386,9 +383,7 @@ impl Parser {
     }
 
     fn peek(&self) -> &Token {
-        self.tokens
-            .get(self.position)
-            .unwrap_or(&Token::End)
+        self.tokens.get(self.position).unwrap_or(&Token::End)
     }
 
     fn next(&mut self) -> Token {
@@ -551,9 +546,7 @@ fn resolve_program_and_args(
         "run-native" => {
             // Compatibility alias: `run-native --allow -- <program> [args]`.
             let mut rest = args.into_iter();
-            if rest.next().as_deref() != Some("--allow")
-                || rest.next().as_deref() != Some("--")
-            {
+            if rest.next().as_deref() != Some("--allow") || rest.next().as_deref() != Some("--") {
                 return Err(ParseError::InvalidOperator(
                     "run-native requires `--allow -- <program> [args]`",
                 ));
@@ -652,8 +645,9 @@ fn builtin_from_words(
             }
             let from = SessionPath::new(args[0].clone())
                 .map_err(|_| ParseError::InvalidBuiltin("source path is not a session path"))?;
-            let to = SessionPath::new(args[1].clone())
-                .map_err(|_| ParseError::InvalidBuiltin("destination path is not a session path"))?;
+            let to = SessionPath::new(args[1].clone()).map_err(|_| {
+                ParseError::InvalidBuiltin("destination path is not a session path")
+            })?;
             if name == "cp" {
                 Builtin::Copy { from, to }
             } else {
@@ -668,11 +662,15 @@ fn builtin_from_words(
             // `export NAME=value` or `export NAME` (mark for removal from overlay).
             let assignment = exactly_one("export", &args)?;
             let (name, value) = match assignment.split_once('=') {
-                Some((name, value)) if !name.is_empty() => (name.to_owned(), Some(value.to_owned())),
+                Some((name, value)) if !name.is_empty() => {
+                    (name.to_owned(), Some(value.to_owned()))
+                }
                 _ => (assignment, None),
             };
             if name.is_empty() || name.chars().any(char::is_whitespace) {
-                return Err(ParseError::InvalidBuiltin("export requires a variable name"));
+                return Err(ParseError::InvalidBuiltin(
+                    "export requires a variable name",
+                ));
             }
             Builtin::Export { name, value }
         }
@@ -704,7 +702,10 @@ mod tests {
             panic!("expected pipeline");
         };
         assert_eq!(stages.len(), 2);
-        assert!(matches!(stages[0].program, Program::Builtin(Builtin::Cd(_))));
+        assert!(matches!(
+            stages[0].program,
+            Program::Builtin(Builtin::Cd(_))
+        ));
         assert_eq!(stages[1].program, Program::External("npm".to_owned()));
         assert_eq!(stages[1].args, ["test"]);
     }
@@ -718,8 +719,7 @@ mod tests {
 
     #[test]
     fn parses_and_or_sequence_and_redirects() {
-        let program = parse("mkdir -p src && cd src || echo failed; ls > out.txt")
-            .expect("parses");
+        let program = parse("mkdir -p src && cd src || echo failed; ls > out.txt").expect("parses");
         let statements = &program.statements;
         assert_eq!(statements.len(), 2);
         // `mkdir -p src && cd src || echo failed` -> Or(And(mkdir, cd), echo)
@@ -733,9 +733,7 @@ mod tests {
         };
         assert_eq!(
             spec.program,
-            Program::Builtin(Builtin::Ls(
-                SessionPath::new(".").expect("valid path")
-            ))
+            Program::Builtin(Builtin::Ls(SessionPath::new(".").expect("valid path")))
         );
         assert_eq!(
             spec.redirects,
@@ -833,7 +831,10 @@ mod tests {
             )
             .expect("valid argv");
         let spec = command_of(&program);
-        assert_eq!(spec.program, Program::WasiComponent("./tool.wasm".to_owned()));
+        assert_eq!(
+            spec.program,
+            Program::WasiComponent("./tool.wasm".to_owned())
+        );
         assert_eq!(spec.args, ["--flag"]);
     }
 

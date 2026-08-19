@@ -147,7 +147,11 @@ impl ApprovalLease {
     /// digest, or expiry rejects the lease. The grant itself is *not* compared
     /// here — the executor checks that the requested operation is within the
     /// lease grant at execution time.
-    pub fn validate_for(&self, session_id: u64, digest: &CommandDigest) -> Result<(), ElevationError> {
+    pub fn validate_for(
+        &self,
+        session_id: u64,
+        digest: &CommandDigest,
+    ) -> Result<(), ElevationError> {
         if self.session_id != session_id {
             return Err(ElevationError::LeaseMismatch);
         }

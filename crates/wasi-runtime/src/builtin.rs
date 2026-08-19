@@ -64,11 +64,7 @@ impl BuiltinExecutor {
     /// The session's cwd is the base for all path resolution; every resolved
     /// path must stay inside the base grant or the builtin fails closed with
     /// [`BuiltinResult::fail`] (no partial side effects are performed).
-    pub fn execute(
-        &self,
-        builtin: &Builtin,
-        session: &mut TerminalSession,
-    ) -> BuiltinResult {
+    pub fn execute(&self, builtin: &Builtin, session: &mut TerminalSession) -> BuiltinResult {
         match builtin {
             Builtin::Pwd => self.pwd(session),
             Builtin::Cd(path) => self.cd(session, path),
@@ -109,7 +105,11 @@ impl BuiltinExecutor {
             Err(error) => return BuiltinResult::fail(&format!("ls: {error}")),
         };
         let mut names: Vec<String> = entries
-            .filter_map(|entry| entry.ok().map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .filter_map(|entry| {
+                entry
+                    .ok()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            })
             .collect();
         names.sort();
         // Bound the listing to the session's output budget.
@@ -277,7 +277,9 @@ impl BuiltinExecutor {
         for directory in std::env::split_paths(&path_value) {
             let candidate = directory.join(name);
             if candidate.is_file() {
-                return BuiltinResult::with_stdout(format!("{}\n", candidate.display()).into_bytes());
+                return BuiltinResult::with_stdout(
+                    format!("{}\n", candidate.display()).into_bytes(),
+                );
             }
         }
         BuiltinResult::fail(&format!("which: {name}: not found"))
@@ -318,8 +320,7 @@ impl BuiltinExecutor {
 /// Whether the grant allows writes below `path`.
 fn grant_allows_write(session: &TerminalSession, path: &Path) -> bool {
     session.base_grant().filesystem_grants().any(|grant| {
-        grant.access() == FilesystemAccess::ReadWrite
-            && session.base_grant().allows_path(path)
+        grant.access() == FilesystemAccess::ReadWrite && session.base_grant().allows_path(path)
     })
 }
 
@@ -327,7 +328,9 @@ fn grant_allows_write(session: &TerminalSession, path: &Path) -> bool {
 /// session-relative target.
 #[allow(dead_code)]
 fn resolved(session: &TerminalSession, path: &SessionPath) -> Result<PathBuf, String> {
-    session.resolve_path(path).map_err(|error| error.to_string())
+    session
+        .resolve_path(path)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -355,7 +358,8 @@ mod tests {
     }
 
     fn test_root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("ferrous-builtin-{name}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("ferrous-builtin-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("root is created");
         root
@@ -422,7 +426,10 @@ mod tests {
             &mut session,
         );
         assert_eq!(result.exit_code, 1);
-        assert!(root.join("file.txt").exists(), "read-only session must not delete");
+        assert!(
+            root.join("file.txt").exists(),
+            "read-only session must not delete"
+        );
 
         let mut session = session_in(&root, FilesystemAccess::ReadWrite, false);
         let result = BuiltinExecutor.execute(
@@ -437,7 +444,10 @@ mod tests {
     fn echo_joins_arguments_and_env_prints_only_the_overlay() {
         let root = test_root("echo-env");
         let mut session = session_in(&root, FilesystemAccess::Read, true);
-        let echo = BuiltinExecutor.execute(&Builtin::Echo(vec!["a".to_owned(), "b".to_owned()]), &mut session);
+        let echo = BuiltinExecutor.execute(
+            &Builtin::Echo(vec!["a".to_owned(), "b".to_owned()]),
+            &mut session,
+        );
         assert_eq!(output_text(&echo), "a b\n");
 
         let export = BuiltinExecutor.execute(
@@ -493,7 +503,10 @@ mod tests {
             &mut session,
         );
         assert_eq!(cp.exit_code, 0);
-        assert_eq!(fs::read(root.join("copy.txt")).expect("copy exists"), b"data");
+        assert_eq!(
+            fs::read(root.join("copy.txt")).expect("copy exists"),
+            b"data"
+        );
 
         let mv = BuiltinExecutor.execute(
             &Builtin::Move {
@@ -504,7 +517,10 @@ mod tests {
         );
         assert_eq!(mv.exit_code, 0);
         assert!(!root.join("copy.txt").exists());
-        assert_eq!(fs::read(root.join("moved.txt")).expect("moved exists"), b"data");
+        assert_eq!(
+            fs::read(root.join("moved.txt")).expect("moved exists"),
+            b"data"
+        );
     }
 
     #[test]
