@@ -1,374 +1,261 @@
-//! The `ferrous shell` REPL.
+//! The `ferrous shell` REPL: a persistent terminal session for humans.
 //!
-//! Phase 1 keeps the CLI as the proof surface. Only the explicit `run-wasi` command
-//! can execute a component; unknown input never falls through to a host shell.
+//! Every line is parsed into the typed Ferrous Shell IR, preflighted against
+//! the session's capability grant, and executed by the shared
+//! `ShellExecutor` — the same backend the AI terminal tool and the future
+//! wterm UI consume. Native external commands require human approval through
+//! an interactive prompt; approval never grants ambient host authority and is
+//! never echoed back into the pipeline.
 
-use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
 
-use anyhow::{Context, Result};
-use wasi_runtime::WasiRuntime;
-use wasi_runtime::broker::ActionBroker;
-use wasi_runtime::capability::{CapabilityGrant, FilesystemAccess};
-use wasi_runtime::command::{Actor, CommandRequest, ExecutionMode, SessionEvent};
+use anyhow::Context;
+use wasi_runtime::capability::{CapabilityGrant, FilesystemAccess, ResourceLimits};
+use wasi_runtime::command::{Actor, SessionEvent, Stream};
+use wasi_runtime::shell_executor::{ApprovalAuthorityView, EventSink, PlanStatus, ShellExecutor};
+use wasi_runtime::shell_ir::SessionPath;
+use wasi_runtime::shell_parse::ShellParser;
+use wasi_runtime::terminal_session::{TerminalSession, TerminalSessionSpec};
 
-/// The result of handling a single built-in shell line.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Outcome {
-    /// Emit a reply and keep the loop running.
-    Reply(String),
-    /// Terminate the loop.
-    Exit,
+/// Options for the interactive shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShellOptions {
+    /// Emit structured JSON records instead of rendered text.
+    pub json: bool,
+    /// Auto-approve native commands within the workspace (CI/test harness).
+    pub auto_approve_native: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct WasiCommand {
-    path: String,
-    args: Vec<String>,
+impl Default for ShellOptions {
+    fn default() -> Self {
+        Self {
+            json: false,
+            auto_approve_native: false,
+        }
+    }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct NativeCommand {
-    explicitly_allowed: bool,
-    program: String,
-    args: Vec<String>,
+/// A human-facing approval authority backed by an interactive prompt.
+struct PromptAuthority {
+    auto_approve: bool,
+    prompted: Arc<Mutex<u64>>,
 }
 
-/// Run the interactive shell until `exit`/`quit` or EOF.
+impl ApprovalAuthorityView for PromptAuthority {
+    fn authorize_native(
+        &self,
+        request: &wasi_runtime::command::CommandRequest,
+    ) -> Result<(), wasi_runtime::shell_executor::ExecuteError> {
+        if self.auto_approve {
+            return Ok(());
+        }
+        let mut stdout = io::stdout();
+        let _ = write!(
+            stdout,
+            "\n⚠  {actor} wants to run `{program}` natively (direct argv, no shell).\n    cwd: {cwd}\n    args: {args}\nApprove? [y/N] ",
+            actor = match request.actor {
+                Actor::Human => "you",
+                Actor::Agent => "the agent",
+                Actor::Subagent => "a subagent",
+                Actor::Skill => "a skill",
+            },
+            program = request.program,
+            cwd = request.cwd.display(),
+            args = request.args.join(" "),
+        );
+        let _ = stdout.flush();
+        let mut answer = String::new();
+        let approved = io::stdin()
+            .lock()
+            .read_line(&mut answer)
+            .map(|_| {
+                let answer = answer.trim().to_ascii_lowercase();
+                matches!(answer.as_str(), "y" | "yes")
+            })
+            .unwrap_or(false);
+        *self.prompted.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+        let _ = write!(stdout, "\n");
+        let _ = stdout.flush();
+        if approved {
+            Ok(())
+        } else {
+            Err(wasi_runtime::shell_executor::ExecuteError::HumanDenied)
+        }
+    }
+}
+
+/// A sink that renders events to a writer (or emits JSON records).
+struct RenderSink<'a, W: Write> {
+    writer: &'a mut W,
+    json: bool,
+    session: &'a TerminalSession,
+}
+
+impl<'a, W: Write> EventSink for RenderSink<'a, W> {
+    fn emit(
+        &mut self,
+        event: SessionEvent,
+    ) -> Result<(), wasi_runtime::shell_executor::ExecuteError> {
+        if self.json {
+            let record = match &event {
+                SessionEvent::Output { stream, bytes } => format!(
+                    "{{\"event\":\"output\",\"stream\":{},\"bytes\":\"{}\"}}",
+                    if *stream == Stream::Stdout {
+                        "\"stdout\""
+                    } else {
+                        "\"stderr\""
+                    },
+                    String::from_utf8_lossy(bytes)
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\""),
+                ),
+                SessionEvent::Exited { code } => {
+                    format!("{{\"event\":\"exited\",\"code\":{code:?}}}")
+                }
+                SessionEvent::Started => "{\"event\":\"started\"}".to_owned(),
+                SessionEvent::Cancelled => "{\"event\":\"cancelled\"}".to_owned(),
+                SessionEvent::Denied => "{\"event\":\"denied\"}".to_owned(),
+                SessionEvent::Unsupported => "{\"event\":\"unsupported\"}".to_owned(),
+                SessionEvent::PendingApproval { .. } => {
+                    "{\"event\":\"pending-approval\"}".to_owned()
+                }
+            };
+            let _ = writeln!(self.writer, "{record}");
+            self.writer.flush().map_err(|error| {
+                wasi_runtime::shell_executor::ExecuteError::Sink(error.to_string())
+            })?;
+            return Ok(());
+        }
+        match event {
+            SessionEvent::Output { stream, bytes } => {
+                let _ = self.writer.write_all(&bytes);
+                let _ = self.writer.flush();
+            }
+            SessionEvent::Exited { code } => {
+                let _ = writeln!(self.writer, "\n[exit {code:?}]");
+            }
+            SessionEvent::Cancelled => {
+                let _ = writeln!(self.writer, "\n[cancelled]");
+            }
+            SessionEvent::Denied => {
+                let _ = writeln!(self.writer, "\n[denied by policy]");
+            }
+            SessionEvent::Unsupported => {
+                let _ = writeln!(self.writer, "\n[unsupported on this host]");
+            }
+            SessionEvent::Started => {}
+            SessionEvent::PendingApproval { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+/// Run the persistent shell until `exit`/`quit` or EOF.
 ///
 /// # Errors
 ///
-/// Returns an error if reading stdin, creating the runtime, or writing stdout fails.
-pub fn run() -> Result<()> {
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
+/// Returns an error if the session cannot be created or stdin/stdout fail.
+pub fn run(options: ShellOptions) -> anyhow::Result<()> {
     let workspace = std::env::current_dir()
         .context("failed to determine the shell workspace")?
         .canonicalize()
         .context("failed to canonicalize the shell workspace")?;
-    let mut runtime = None;
-    let mut broker = None;
-    let mut session_id = 0_u64;
+    run_in(workspace, options)
+}
 
-    tracing::info!(workspace = %workspace.display(), "ferrous shell started (Phase 1)");
-    if !write_line(
-        &mut stdout,
-        "ferrous shell (Phase 1). Type `help` for commands, `run-wasi <component>` to execute a WASI component, or `exit` to quit.",
-    )? {
-        return Ok(()); // reader already gone — exit cleanly
-    }
+/// Run the persistent shell rooted at `workspace`.
+///
+/// # Errors
+///
+/// Returns an error if the session cannot be created or stdin/stdout fail.
+pub fn run_in(workspace: PathBuf, options: ShellOptions) -> anyhow::Result<()> {
+    let limits = ResourceLimits::new(4 * 1024 * 1024, 120).map_err(anyhow::Error::new)?;
+    let grant = CapabilityGrant::workspace(&workspace, FilesystemAccess::ReadWrite)
+        .map_err(anyhow::Error::new)?
+        .with_limits(limits);
+    let session_spec = TerminalSessionSpec {
+        id: 1,
+        actor: Actor::Human,
+        cwd: SessionPath::new(".").map_err(|_| anyhow::anyhow!("invalid cwd"))?,
+        base_grant: grant,
+        limits,
+    };
+    let mut session = TerminalSession::new(session_spec).map_err(anyhow::Error::new)?;
+    let executor = ShellExecutor::new().map_err(anyhow::Error::new)?;
+    let parser = ShellParser::new();
+    let authority = PromptAuthority {
+        auto_approve: options.auto_approve_native,
+        prompted: Arc::new(Mutex::new(0)),
+    };
+
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    // Banner writes are best-effort: a closed stdout pipe must exit cleanly.
+    let _ = writeln!(
+        stdout,
+        "ferrous shell — persistent session in {}",
+        session.cwd_display()
+    );
+    let _ = writeln!(
+        stdout,
+        "Try: `pwd`, `ls`, `cd sub`, `mkdir newdir`, `echo hi`, `export FOO=bar`, `npm test` (needs approval), `exit`"
+    );
 
     for line in stdin.lock().lines() {
         let line = line?;
         let trimmed = line.trim();
-        if let Some(command) = parse_wasi_command(trimmed) {
-            session_id = session_id.saturating_add(1);
-            if runtime.is_none() {
-                runtime = Some(WasiRuntime::new().map_err(anyhow::Error::new)?);
-            }
-            let Some(runtime) = runtime.as_ref() else {
-                return Err(anyhow::anyhow!("WASI runtime was not initialized"));
-            };
-            let output = execute_wasi(runtime, &workspace, session_id, command)?;
-            if !write_bytes(&mut stdout, &output.stdout)? {
-                break;
-            }
-            if !write_bytes(&mut stdout, &output.stderr)? {
-                break;
-            }
-            if output.exit_code != 0
-                && !write_line(&mut stdout, "WASI component exited with code 1")?
-            {
-                break;
-            }
+        if trimmed.is_empty() {
             continue;
         }
-
-        if let Some(command) = parse_native_command(trimmed) {
-            if !command.explicitly_allowed {
-                if !write_line(
-                    &mut stdout,
-                    "native execution requires explicit approval: use `run-native --allow -- <program> [args]`",
-                )? {
-                    break;
-                }
+        match trimmed {
+            "exit" | "quit" => {
+                let _ = writeln!(stdout, "bye");
+                break;
+            }
+            "version" => {
+                let _ = writeln!(stdout, "ferrous {}", shared::VERSION);
                 continue;
             }
-            session_id = session_id.saturating_add(1);
-            if broker.is_none() {
-                broker = Some(ActionBroker::new().map_err(anyhow::Error::new)?);
+            "help" | "?" => {
+                let _ = writeln!(
+                    stdout,
+                    "Builtins: pwd, cd, ls, cat, mkdir, rm, cp, mv, echo, env, which, export\n\
+                     Operators: | && || ; > >> < &\n\
+                     External programs run natively with approval. `exit` quits."
+                );
+                continue;
             }
-            let Some(broker) = broker.as_ref() else {
-                return Err(anyhow::anyhow!("native broker was not initialized"));
-            };
-            run_native_command(broker, &workspace, session_id, command, &mut stdout)?;
-            continue;
+            _ => {}
         }
 
-        match handle_line(trimmed) {
-            Outcome::Reply(reply) if reply.is_empty() => {}
-            Outcome::Reply(reply) => {
-                if !write_line(&mut stdout, &reply)? {
-                    break; // reader closed the pipe — exit cleanly (like `yes | head`)
+        match parser.parse(trimmed) {
+            Ok(program) => {
+                let mut sink = RenderSink {
+                    writer: &mut stdout,
+                    json: options.json,
+                    session: &session,
+                };
+                match executor.execute(&program, &mut session, &authority, &mut sink) {
+                    Ok(result) => {
+                        if result.status == PlanStatus::Denied {
+                            let _ = writeln!(stdout, "\n[denied]");
+                        }
+                    }
+                    Err(error) => {
+                        let _ = writeln!(stdout, "\n[error] {error}");
+                    }
                 }
             }
-            Outcome::Exit => {
-                let _ = write_line(&mut stdout, "bye"); // best-effort goodbye
-                break;
+            Err(error) => {
+                let _ = writeln!(stdout, "\n[parse error] {error}");
             }
         }
     }
 
+    session.close();
     Ok(())
-}
-
-fn execute_wasi(
-    runtime: &WasiRuntime,
-    workspace: &Path,
-    session_id: u64,
-    command: WasiCommand,
-) -> Result<wasi_runtime::WasiOutput> {
-    let component_path = workspace.join(&command.path);
-    let component_path = component_path
-        .canonicalize()
-        .with_context(|| format!("WASI component not found: {}", component_path.display()))?;
-    if !component_path.starts_with(workspace) {
-        return Err(anyhow::anyhow!(
-            "WASI component is outside the selected workspace"
-        ));
-    }
-
-    let bytes = fs::read(&component_path).with_context(|| {
-        format!(
-            "failed to read WASI component: {}",
-            component_path.display()
-        )
-    })?;
-    let component = runtime
-        .compile_component(&bytes)
-        .map_err(anyhow::Error::new)
-        .context("failed to admit WASI component")?;
-    let grant = CapabilityGrant::workspace(workspace.to_path_buf(), FilesystemAccess::ReadWrite)
-        .map_err(anyhow::Error::new)
-        .context("failed to create workspace capability")?;
-    let request = CommandRequest::new(
-        session_id,
-        Actor::Human,
-        ExecutionMode::Wasi,
-        component_path.to_string_lossy().into_owned(),
-        command.args,
-        workspace.to_path_buf(),
-        grant,
-    )
-    .map_err(anyhow::Error::new)
-    .context("WASI command was denied by capability policy")?;
-
-    runtime
-        .run_wasi(&component, &request)
-        .map_err(anyhow::Error::new)
-        .context("WASI command failed")
-}
-
-/// Write bytes to stdout, returning `Ok(false)` when the reader is gone.
-fn write_bytes(stdout: &mut impl Write, bytes: &[u8]) -> io::Result<bool> {
-    match stdout.write_all(bytes) {
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(false),
-        Err(e) => Err(e),
-        Ok(()) => Ok(true),
-    }
-}
-
-/// Write one line to stdout, returning `Ok(false)` when the reader is gone
-/// (broken pipe) so the shell can stop instead of erroring out.
-fn write_line(stdout: &mut impl Write, text: &str) -> io::Result<bool> {
-    match writeln!(stdout, "{text}") {
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(false),
-        Err(e) => Err(e),
-        Ok(()) => Ok(true),
-    }
-}
-
-fn parse_wasi_command(line: &str) -> Option<WasiCommand> {
-    let mut tokens = line.split_whitespace();
-    if tokens.next()? != "run-wasi" {
-        return None;
-    }
-    let path = tokens.next()?.to_owned();
-    Some(WasiCommand {
-        path,
-        args: tokens.map(str::to_owned).collect(),
-    })
-}
-
-fn parse_native_command(line: &str) -> Option<NativeCommand> {
-    let tokens = tokenize_native_line(line)?;
-    if tokens.first()? != "run-native" {
-        return None;
-    }
-    if tokens.get(1).is_some_and(|token| token == "--allow") {
-        if tokens.get(2).map(String::as_str) != Some("--") {
-            return Some(NativeCommand {
-                explicitly_allowed: false,
-                program: String::new(),
-                args: Vec::new(),
-            });
-        }
-        let program = tokens.get(3)?.clone();
-        return Some(NativeCommand {
-            explicitly_allowed: true,
-            program,
-            args: tokens[4..].to_vec(),
-        });
-    }
-    let program = tokens.get(1)?.clone();
-    Some(NativeCommand {
-        explicitly_allowed: false,
-        program,
-        args: tokens[2..].to_vec(),
-    })
-}
-
-/// Tokenize native input without executing it. Quotes group an argument, while
-/// the resulting values remain direct argv entries for the PTY backend.
-fn tokenize_native_line(line: &str) -> Option<Vec<String>> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
-    let mut escaped = false;
-    let mut started = false;
-
-    for character in line.chars() {
-        if escaped {
-            current.push(character);
-            escaped = false;
-            started = true;
-            continue;
-        }
-        match quote {
-            Some(delimiter) if character == delimiter => quote = None,
-            Some(_) => current.push(character),
-            None if character == '\\' => {
-                escaped = true;
-                started = true;
-            }
-            None if character == '\'' || character == '"' => {
-                quote = Some(character);
-                started = true;
-            }
-            None if character.is_whitespace() => {
-                if started {
-                    tokens.push(std::mem::take(&mut current));
-                    started = false;
-                }
-            }
-            None => {
-                current.push(character);
-                started = true;
-            }
-        }
-    }
-    if escaped || quote.is_some() {
-        return None;
-    }
-    if started {
-        tokens.push(current);
-    }
-    Some(tokens)
-}
-
-fn run_native_command(
-    broker: &ActionBroker,
-    workspace: &Path,
-    session_id: u64,
-    command: NativeCommand,
-    stdout: &mut impl Write,
-) -> Result<()> {
-    let grant = CapabilityGrant::workspace(workspace.to_path_buf(), FilesystemAccess::ReadWrite)
-        .map_err(anyhow::Error::new)
-        .context("failed to create native workspace capability")?
-        .allow_native_execution();
-    let request = CommandRequest::new(
-        session_id,
-        Actor::Human,
-        ExecutionMode::Native,
-        command.program,
-        command.args,
-        workspace.to_path_buf(),
-        grant,
-    )
-    .map_err(anyhow::Error::new)
-    .context("native command was denied by capability policy")?;
-    let events = broker
-        .submit_native_streaming(request)
-        .map_err(anyhow::Error::new)
-        .context("failed to submit native command")?;
-
-    loop {
-        match events
-            .recv()
-            .context("native session event channel closed")?
-        {
-            SessionEvent::PendingApproval { .. } => {
-                broker
-                    .approve(session_id)
-                    .map_err(anyhow::Error::new)
-                    .context("failed to approve native command")?;
-            }
-            SessionEvent::Started => {}
-            SessionEvent::Output { bytes, .. } => {
-                if !write_bytes(stdout, &bytes)? {
-                    let _ = broker.cancel(session_id);
-                    break;
-                }
-            }
-            SessionEvent::Exited { code } => {
-                if !write_line(stdout, &format!("native process exited with code {code:?}"))? {
-                    break;
-                }
-                break;
-            }
-            SessionEvent::Cancelled => {
-                if !write_line(stdout, "native process cancelled")? {
-                    break;
-                }
-                break;
-            }
-            SessionEvent::Denied => {
-                if !write_line(stdout, "native process denied")? {
-                    break;
-                }
-                break;
-            }
-            SessionEvent::Unsupported => {
-                if !write_line(stdout, "native execution unsupported on this host")? {
-                    break;
-                }
-                break;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Handle one trimmed input line, returning the [`Outcome`] for the caller to act on.
-///
-/// Kept free of I/O so it can be unit-tested directly.
-pub fn handle_line(line: &str) -> Outcome {
-    match line {
-        "" => Outcome::Reply(String::new()),
-        "help" | "?" => Outcome::Reply(help_text().to_owned()),
-        "version" => Outcome::Reply(format!("ferrous {}", shared::VERSION)),
-        "exit" | "quit" => Outcome::Exit,
-        other => Outcome::Reply(format!(
-            "`{other}`: unsupported; use `run-wasi <component>` or `run-native --allow -- <program> [args]`"
-        )),
-    }
-}
-
-/// The help text printed by `help`.
-fn help_text() -> &'static str {
-    "Available commands:\n  help                                  show this help\n  version                               print the version\n  run-wasi <component> [args]           run an explicitly selected WASI component\n  run-native --allow -- <program> [args] run an approved native PTY command\n  exit                                  quit the shell"
 }
 
 #[cfg(test)]
@@ -377,85 +264,89 @@ mod tests {
     use super::*;
 
     #[test]
-    fn help_replies_with_command_listing() {
-        let Outcome::Reply(reply) = handle_line("help") else {
-            panic!("expected a reply");
+    fn render_sink_emits_output_bytes() {
+        let session = TerminalSession::new(TerminalSessionSpec {
+            id: 1,
+            actor: Actor::Human,
+            cwd: SessionPath::new(".").expect("valid cwd"),
+            base_grant: CapabilityGrant::empty(),
+            limits: ResourceLimits::new(1024, 30).expect("valid limits"),
+        })
+        .expect("session");
+        let mut output = Vec::new();
+        {
+            let mut sink = RenderSink {
+                writer: &mut output,
+                json: false,
+                session: &session,
+            };
+            sink.emit(SessionEvent::Output {
+                stream: Stream::Stdout,
+                bytes: b"hi\n".to_vec(),
+            })
+            .expect("emits");
+        }
+        assert_eq!(output, b"hi\n");
+    }
+
+    #[test]
+    fn json_sink_escapes_output_bytes() {
+        let session = TerminalSession::new(TerminalSessionSpec {
+            id: 1,
+            actor: Actor::Human,
+            cwd: SessionPath::new(".").expect("valid cwd"),
+            base_grant: CapabilityGrant::empty(),
+            limits: ResourceLimits::new(1024, 30).expect("valid limits"),
+        })
+        .expect("session");
+        let mut output = Vec::new();
+        {
+            let mut sink = RenderSink {
+                writer: &mut output,
+                json: true,
+                session: &session,
+            };
+            sink.emit(SessionEvent::Output {
+                stream: Stream::Stdout,
+                bytes: b"a\"b\\c".to_vec(),
+            })
+            .expect("emits");
+        }
+        let text = String::from_utf8(output).expect("utf8");
+        assert!(text.contains("\\\""));
+        assert!(text.contains("\\\\"));
+    }
+
+    #[test]
+    fn prompt_authority_auto_approves_in_auto_mode() {
+        let authority = PromptAuthority {
+            auto_approve: true,
+            prompted: Arc::new(Mutex::new(0)),
         };
-        assert!(reply.contains("help"));
-        assert!(reply.contains("version"));
-        assert!(reply.contains("run-wasi"));
-        assert!(reply.contains("exit"));
+        // No actual request needed: auto-approve short-circuits before use.
+        let request = wasi_runtime::command::CommandRequest::new(
+            1,
+            Actor::Agent,
+            wasi_runtime::command::ExecutionMode::Native,
+            "cargo",
+            ["test"],
+            std::env::temp_dir(),
+            CapabilityGrant::empty().allow_native_execution(),
+        )
+        .expect("request");
+        assert!(authority.authorize_native(&request).is_ok());
     }
 
     #[test]
-    fn version_replies_with_version() {
-        let Outcome::Reply(reply) = handle_line("version") else {
-            panic!("expected a reply");
-        };
-        assert!(reply.starts_with("ferrous "));
-    }
-
-    #[test]
-    fn exit_and_quit_terminate() {
-        assert_eq!(handle_line("exit"), Outcome::Exit);
-        assert_eq!(handle_line("quit"), Outcome::Exit);
-    }
-
-    #[test]
-    fn blank_line_is_a_noop() {
-        assert_eq!(handle_line(""), Outcome::Reply(String::new()));
-    }
-
-    #[test]
-    fn unknown_command_is_not_a_native_shell_fallback() {
-        let Outcome::Reply(reply) = handle_line("echo hello") else {
-            panic!("expected a reply");
-        };
-        assert!(reply.contains("unsupported"));
-    }
-
-    #[test]
-    fn parses_run_native_with_direct_args() {
-        let parsed = parse_native_command("run-native --allow -- cargo test")
-            .expect("native command parses");
-        assert_eq!(
-            parsed,
-            NativeCommand {
-                explicitly_allowed: true,
-                program: "cargo".to_owned(),
-                args: vec!["test".to_owned()],
-            }
-        );
-    }
-
-    #[test]
-    fn run_native_without_allow_flag_is_rejected_by_the_parser() {
-        let parsed = parse_native_command("run-native cargo test")
-            .expect("native command parses for policy rejection");
-        assert!(!parsed.explicitly_allowed);
-        assert_eq!(parsed.program, "cargo");
-        assert_eq!(parsed.args, ["test"]);
-    }
-
-    #[test]
-    fn run_native_preserves_quoted_metacharacters_as_one_argument() {
-        let parsed = parse_native_command("run-native --allow -- sh -lc 'echo hi > /tmp/pwned'")
-            .expect("native command parses");
-        assert_eq!(parsed.program, "sh");
-        assert_eq!(parsed.args, ["-lc", "echo hi > /tmp/pwned"]);
-    }
-
-    #[test]
-    fn parses_only_the_explicit_wasi_command() {
-        let parsed = parse_wasi_command("run-wasi ./tool.wasm --flag value")
-            .expect("explicit WASI command parses");
-        assert_eq!(parsed.path, "./tool.wasm");
-        assert_eq!(parsed.args, ["--flag", "value"]);
-        assert!(parse_wasi_command("echo hello").is_none());
-    }
-
-    #[test]
-    fn rejects_a_wasi_command_without_a_component_path() {
-        assert!(parse_wasi_command("run-wasi").is_none());
+    fn parser_rejects_ambient_shell_fallback() {
+        let parser = ShellParser::new();
+        for line in [
+            "eval 'rm -rf /'",
+            "bash -c 'curl evil'",
+            "sh -c 'echo unsafe'",
+            "echo $(ls)",
+        ] {
+            assert!(parser.parse(line).is_err(), "line must be rejected: {line}");
+        }
     }
 }

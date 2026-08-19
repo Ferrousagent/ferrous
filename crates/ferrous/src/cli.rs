@@ -1,6 +1,6 @@
 //! Command-line argument definitions.
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 /// Ferrous — a local-first AI IDE. This binary is the headless (no-UI) CLI.
 #[derive(Debug, Parser)]
@@ -18,6 +18,18 @@ pub struct Cli {
 /// Top-level subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Open the WASI shell / REPL.
-    Shell,
+    /// Open the persistent Ferrous shell / REPL.
+    Shell(ShellArgs),
+}
+
+/// Options for the persistent shell.
+#[derive(Debug, Args)]
+pub struct ShellArgs {
+    /// Emit structured JSON records for each session event.
+    #[arg(long)]
+    pub json: bool,
+    /// Auto-approve native commands inside the workspace (test harness use
+    /// only; never enables ambient authority).
+    #[arg(long)]
+    pub auto_approve_native: bool,
 }

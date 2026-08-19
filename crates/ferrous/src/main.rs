@@ -9,7 +9,10 @@ fn main() -> anyhow::Result<()> {
     init_tracing();
 
     match cli::Cli::parse().command {
-        cli::Command::Shell => shell::run(),
+        cli::Command::Shell(args) => shell::run(shell::ShellOptions {
+            json: args.json,
+            auto_approve_native: args.auto_approve_native,
+        }),
     }
 }
 

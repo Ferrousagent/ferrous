@@ -23,7 +23,8 @@ fn shell_runs_help_and_exits() {
         .write_stdin("help\nexit\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Available commands"))
+        .stdout(predicate::str::contains("ferrous shell"))
+        .stdout(predicate::str::contains("Builtins:"))
         .stdout(predicate::str::contains("bye"));
 }
 
@@ -39,14 +40,61 @@ fn shell_version_prints_version() {
 }
 
 #[test]
-fn shell_unknown_command_reports_phase_one() {
+fn shell_cd_persists_for_the_next_command() {
     Command::cargo_bin("ferrous")
         .unwrap()
         .args(["shell"])
-        .write_stdin("wasi hello\nexit\n")
+        .write_stdin("mkdir sub && cd sub && pwd\nexit\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Phase 1"));
+        .stdout(predicate::str::contains("sub"));
+}
+
+#[test]
+fn shell_echo_and_builtins_run_in_process() {
+    Command::cargo_bin("ferrous")
+        .unwrap()
+        .args(["shell"])
+        .write_stdin("echo hello ferrous\nexit\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello ferrous"));
+}
+
+#[test]
+fn shell_rejects_eval_and_shell_escapes_without_fallback() {
+    Command::cargo_bin("ferrous")
+        .unwrap()
+        .args(["shell"])
+        .write_stdin("eval 'rm -rf /'\nexit\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("parse error"));
+}
+
+#[test]
+fn shell_never_falls_through_unknown_input_to_a_host_shell() {
+    // `wasi hello` parses as an external command; without approval it is
+    // denied by the prompt authority, never handed to a host shell.
+    Command::cargo_bin("ferrous")
+        .unwrap()
+        .args(["shell", "--auto-approve-native"])
+        .write_stdin("definitely-not-a-real-tool-xyz arg1\nexit\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("error"));
+}
+
+#[test]
+fn shell_json_mode_emits_structured_records() {
+    Command::cargo_bin("ferrous")
+        .unwrap()
+        .args(["shell", "--json"])
+        .write_stdin("echo hi\nexit\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"event\":\"output\""))
+        .stdout(predicate::str::contains("\"stream\":\"stdout\""));
 }
 
 #[test]
