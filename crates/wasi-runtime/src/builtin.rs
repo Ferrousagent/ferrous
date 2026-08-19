@@ -346,6 +346,9 @@ mod tests {
         let mut grant = CapabilityGrant::workspace(root, access).expect("absolute workspace");
         if allow_env {
             grant = grant.allow_environment("ALLOWED").expect("valid name");
+            // `which` resolves programs through an exported PATH, so tests that
+            // exercise it must allowlist PATH in the session overlay.
+            grant = grant.allow_environment("PATH").expect("valid name");
         }
         TerminalSession::new(TerminalSessionSpec {
             id: 1,

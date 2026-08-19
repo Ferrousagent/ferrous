@@ -29,14 +29,14 @@
 
 use std::io::Write;
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use crate::builtin::{BuiltinExecutor, BuiltinResult};
 use crate::cancel::CancelHandle;
 use crate::capability::{CapabilityGrant, ResourceLimits};
 use crate::command::{Actor, CommandRequest, ExecutionMode, SessionEvent, Stream};
-use crate::native::{NativeBackend, NativeError, NativeOutput};
+use crate::native::{NativeBackend, NativeError};
 use crate::native_session::NativeSessionHandle;
 use crate::shell_ir::{Builtin, CommandSpec, Program, Redirect, ShellProgram, Statement};
 use crate::terminal_session::{SessionPath, TerminalSession, TerminalSessionSpec};
@@ -92,6 +92,12 @@ pub enum ExecuteError {
     /// The native backend rejected the command.
     #[error("native execution failed: {0}")]
     Native(#[from] NativeError),
+    /// The command request was rejected at construction.
+    #[error("invalid command request: {0}")]
+    Command(#[from] crate::command::CommandError),
+    /// The filesystem rejected an executor operation.
+    #[error("filesystem error: {0}")]
+    Io(#[from] std::io::Error),
     /// The session rejected the operation.
     #[error("session error: {0}")]
     Session(#[from] crate::terminal_session::SessionError),
@@ -407,19 +413,21 @@ impl ShellExecutor {
                 let stdout_capture = std::mem::take(&mut result.stdout);
                 let stderr_capture = std::mem::take(&mut result.stderr);
                 let code = result.exit_code;
+                let stdout_redirected = stdout_target.is_some();
+                let stderr_redirected = stderr_target.is_some();
                 apply_redirects(
                     stdout_target,
                     stderr_target,
                     &stdout_capture,
                     &stderr_capture,
                 )?;
-                if stdout_target.is_none() && !stdout_capture.is_empty() {
+                if !stdout_redirected && !stdout_capture.is_empty() {
                     sink.emit(SessionEvent::Output {
                         stream: Stream::Stdout,
                         bytes: stdout_capture,
                     })?;
                 }
-                if stderr_target.is_none() && !stderr_capture.is_empty() {
+                if !stderr_redirected && !stderr_capture.is_empty() {
                     sink.emit(SessionEvent::Output {
                         stream: Stream::Stderr,
                         bytes: stderr_capture,
@@ -454,7 +462,7 @@ impl ShellExecutor {
                 authority.authorize_native(&request)?;
                 let native = NativeBackend::new().spawn(&request)?;
                 let cancel = CancelHandle::new();
-                let (events_tx, events_rx) = mpsc::channel();
+                let (events_tx, _events_rx) = mpsc::channel();
                 let session_handle =
                     NativeSessionHandle::new(native, cancel, session.limits(), events_tx);
                 let runner = std::thread::spawn(move || session_handle.run());
@@ -491,7 +499,7 @@ impl ShellExecutor {
                             audit_id: 0,
                         });
                     }
-                    Err(error) => {
+                    Err(_) => {
                         sink.emit(SessionEvent::Unsupported)?;
                         return Ok(PlanResult {
                             status: PlanStatus::Failed,
@@ -506,19 +514,21 @@ impl ShellExecutor {
                     }
                 };
                 let code = i32::try_from(captured.exit_code).unwrap_or(1);
+                let stdout_redirected = stdout_target.is_some();
+                let stderr_redirected = stderr_target.is_some();
                 apply_redirects(
                     stdout_target,
                     stderr_target,
                     &captured.stdout,
                     &captured.stderr,
                 )?;
-                if stdout_target.is_none() && !captured.stdout.is_empty() {
+                if !stdout_redirected && !captured.stdout.is_empty() {
                     sink.emit(SessionEvent::Output {
                         stream: Stream::Stdout,
                         bytes: captured.stdout,
                     })?;
                 }
-                if stderr_target.is_none() && !captured.stderr.is_empty() {
+                if !stderr_redirected && !captured.stderr.is_empty() {
                     sink.emit(SessionEvent::Output {
                         stream: Stream::Stderr,
                         bytes: captured.stderr,
@@ -563,6 +573,8 @@ impl ShellExecutor {
                 let runner = std::thread::spawn(move || {
                     runtime.run_wasi_events(&component, &request, &runner_cancel, &events_tx)
                 });
+                let stdout_redirected = stdout_target.is_some();
+                let stderr_redirected = stderr_target.is_some();
                 let mut stdout_capture = Vec::new();
                 let mut stderr_capture = Vec::new();
                 loop {
@@ -573,7 +585,13 @@ impl ShellExecutor {
                             } else {
                                 stderr_capture.extend_from_slice(&bytes);
                             }
-                            sink.emit(SessionEvent::Output { stream, bytes })?;
+                            let emit = match stream {
+                                Stream::Stdout => !stdout_redirected,
+                                Stream::Stderr => !stderr_redirected,
+                            };
+                            if emit {
+                                sink.emit(SessionEvent::Output { stream, bytes })?;
+                            }
                         }
                         Ok(_) => {}
                         Err(RecvTimeoutError::Timeout) => {}
@@ -662,7 +680,7 @@ impl ShellExecutor {
             let input_rx = if index == 0 {
                 None
             } else {
-                receivers.get(index - 1).cloned()
+                Some(receivers.remove(index - 1))
             };
             let output_tx = senders.get(index).cloned();
             let runtime = self.runtime.clone();
@@ -799,7 +817,7 @@ fn run_pipeline_stage(
                 grant.clone().allow_native_execution(),
             )?;
             let native = NativeBackend::new().spawn(&request)?;
-            let (events_tx, events_rx) = mpsc::channel();
+            let (events_tx, _events_rx) = mpsc::channel();
             let handle = NativeSessionHandle::new(native, cancel.clone(), limits, events_tx);
             // Feed the previous stage's output into this stage's PTY input.
             if let Some(input_rx) = input_rx {
@@ -925,9 +943,11 @@ mod tests {
     use crate::capability::{CapabilityGrant, FilesystemAccess};
     use crate::shell_ir::{CommandDigest, NativeShellKind};
 
-    fn test_session() -> (TerminalSession, std::path::PathBuf) {
-        let root =
-            std::env::temp_dir().join(format!("ferrous-executor-test-{}", std::process::id()));
+    fn test_session(name: &str) -> (TerminalSession, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "ferrous-executor-test-{name}-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("root is created");
         std::fs::create_dir_all(root.join("sub")).expect("subdir is created");
@@ -965,9 +985,20 @@ mod tests {
             .collect()
     }
 
+    /// A test authority that approves every native command. Used only to
+    /// exercise executor sequencing; real sessions must go through the human
+    /// authority.
+    struct TestApprove;
+
+    impl ApprovalAuthorityView for TestApprove {
+        fn authorize_native(&self, _request: &CommandRequest) -> Result<(), ExecuteError> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn builtin_echo_runs_in_process() {
-        let (mut session, _root) = test_session();
+        let (mut session, _root) = test_session("echo");
         let executor = ShellExecutor::new().expect("executor");
         let program = ShellProgram {
             statements: vec![Statement::Command(command(
@@ -984,9 +1015,13 @@ mod tests {
         assert_eq!(output_of(&sink), b"hi\n");
     }
 
+    /// `false || echo fallback` exercises the OR short-circuit with a real
+    /// native exit code. Unix-only: `false` is a Unix executable and Windows
+    /// has no cross-platform failing program to stand in.
+    #[cfg(unix)]
     #[test]
     fn or_sequence_runs_fallback_on_failure() {
-        let (mut session, _root) = test_session();
+        let (mut session, _root) = test_session("or-fallback");
         let executor = ShellExecutor::new().expect("executor");
         // `false || echo fallback` -> exit 0, prints fallback.
         let program = ShellProgram {
@@ -1003,7 +1038,7 @@ mod tests {
         };
         let mut sink = VecSink::default();
         let result = executor
-            .execute(&program, &mut session, &DenyNative, &mut sink)
+            .execute(&program, &mut session, &TestApprove, &mut sink)
             .expect("executes");
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(output_of(&sink), b"fallback\n");
@@ -1011,7 +1046,7 @@ mod tests {
 
     #[test]
     fn cd_then_pwd_uses_the_new_directory() {
-        let (mut session, root) = test_session();
+        let (mut session, root) = test_session("cd-pwd");
         let executor = ShellExecutor::new().expect("executor");
         let program = ShellProgram {
             statements: vec![
@@ -1033,7 +1068,7 @@ mod tests {
 
     #[test]
     fn redirection_cannot_write_outside_the_grant() {
-        let (mut session, _root) = test_session();
+        let (mut session, _root) = test_session("redirect-deny");
         let executor = ShellExecutor::new().expect("executor");
         let spec = CommandSpec {
             program: Program::Builtin(Builtin::Echo(vec!["data".to_owned()])),
@@ -1061,7 +1096,7 @@ mod tests {
 
     #[test]
     fn redirection_writes_to_a_capability_checked_file() {
-        let (mut session, root) = test_session();
+        let (mut session, root) = test_session("redirect-write");
         let executor = ShellExecutor::new().expect("executor");
         let spec = CommandSpec {
             program: Program::Builtin(Builtin::Echo(vec!["data".to_owned()])),
@@ -1093,7 +1128,7 @@ mod tests {
 
     #[test]
     fn input_redirect_feeds_a_builtin() {
-        let (mut session, _root) = test_session();
+        let (mut session, _root) = test_session("input-redirect");
         let executor = ShellExecutor::new().expect("executor");
         let spec = CommandSpec {
             program: Program::Builtin(Builtin::Cat(SessionPath::new("x").expect("valid path"))),
@@ -1115,7 +1150,7 @@ mod tests {
 
     #[test]
     fn native_shell_is_never_synthesized_by_the_executor() {
-        let (mut session, _root) = test_session();
+        let (mut session, _root) = test_session("native-shell");
         let executor = ShellExecutor::new().expect("executor");
         let program = ShellProgram {
             statements: vec![Statement::Command(command(
@@ -1132,7 +1167,7 @@ mod tests {
 
     #[test]
     fn pipeline_builtins_flow_bounded_output() {
-        let (mut session, _root) = test_session();
+        let (mut session, _root) = test_session("pipeline");
         let executor = ShellExecutor::new().expect("executor");
         let program = ShellProgram {
             statements: vec![Statement::Pipeline(vec![
@@ -1171,7 +1206,7 @@ mod tests {
 
     #[test]
     fn background_job_registers_in_the_session_and_close_kills_it() {
-        let (mut session, _root) = test_session();
+        let (mut session, _root) = test_session("background");
         let executor = ShellExecutor::new().expect("executor");
         let program = ShellProgram {
             statements: vec![Statement::Background(Box::new(Statement::Command(

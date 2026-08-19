@@ -5,6 +5,16 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+/// A fresh, unique working directory for one shell test. Every test gets its
+/// own root so parallel runs never race, repeated runs are idempotent, and no
+/// test ever touches the repository checkout.
+fn fresh_shell_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("ferrous-cli-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("shell test dir is created");
+    dir
+}
+
 #[test]
 fn version_flag_prints_version() {
     Command::cargo_bin("ferrous")
@@ -19,6 +29,7 @@ fn version_flag_prints_version() {
 fn shell_runs_help_and_exits() {
     Command::cargo_bin("ferrous")
         .unwrap()
+        .current_dir(fresh_shell_dir("help"))
         .args(["shell"])
         .write_stdin("help\nexit\n")
         .assert()
@@ -32,6 +43,7 @@ fn shell_runs_help_and_exits() {
 fn shell_version_prints_version() {
     Command::cargo_bin("ferrous")
         .unwrap()
+        .current_dir(fresh_shell_dir("version"))
         .args(["shell"])
         .write_stdin("version\nexit\n")
         .assert()
@@ -43,6 +55,7 @@ fn shell_version_prints_version() {
 fn shell_cd_persists_for_the_next_command() {
     Command::cargo_bin("ferrous")
         .unwrap()
+        .current_dir(fresh_shell_dir("cd-persists"))
         .args(["shell"])
         .write_stdin("mkdir sub && cd sub && pwd\nexit\n")
         .assert()
@@ -54,6 +67,7 @@ fn shell_cd_persists_for_the_next_command() {
 fn shell_echo_and_builtins_run_in_process() {
     Command::cargo_bin("ferrous")
         .unwrap()
+        .current_dir(fresh_shell_dir("echo"))
         .args(["shell"])
         .write_stdin("echo hello ferrous\nexit\n")
         .assert()
@@ -65,6 +79,7 @@ fn shell_echo_and_builtins_run_in_process() {
 fn shell_rejects_eval_and_shell_escapes_without_fallback() {
     Command::cargo_bin("ferrous")
         .unwrap()
+        .current_dir(fresh_shell_dir("reject-eval"))
         .args(["shell"])
         .write_stdin("eval 'rm -rf /'\nexit\n")
         .assert()
@@ -78,6 +93,7 @@ fn shell_never_falls_through_unknown_input_to_a_host_shell() {
     // denied by the prompt authority, never handed to a host shell.
     Command::cargo_bin("ferrous")
         .unwrap()
+        .current_dir(fresh_shell_dir("no-fallback"))
         .args(["shell", "--auto-approve-native"])
         .write_stdin("definitely-not-a-real-tool-xyz arg1\nexit\n")
         .assert()
@@ -89,6 +105,7 @@ fn shell_never_falls_through_unknown_input_to_a_host_shell() {
 fn shell_json_mode_emits_structured_records() {
     Command::cargo_bin("ferrous")
         .unwrap()
+        .current_dir(fresh_shell_dir("json"))
         .args(["shell", "--json"])
         .write_stdin("echo hi\nexit\n")
         .assert()

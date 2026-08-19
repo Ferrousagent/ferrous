@@ -9,7 +9,6 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::Context;
 use wasi_runtime::capability::{CapabilityGrant, FilesystemAccess, ResourceLimits};
@@ -40,7 +39,6 @@ impl Default for ShellOptions {
 /// A human-facing approval authority backed by an interactive prompt.
 struct PromptAuthority {
     auto_approve: bool,
-    prompted: Arc<Mutex<u64>>,
 }
 
 impl ApprovalAuthorityView for PromptAuthority {
@@ -75,7 +73,6 @@ impl ApprovalAuthorityView for PromptAuthority {
                 matches!(answer.as_str(), "y" | "yes")
             })
             .unwrap_or(false);
-        *self.prompted.lock().unwrap_or_else(PoisonError::into_inner) += 1;
         let _ = write!(stdout, "\n");
         let _ = stdout.flush();
         if approved {
@@ -90,7 +87,6 @@ impl ApprovalAuthorityView for PromptAuthority {
 struct RenderSink<'a, W: Write> {
     writer: &'a mut W,
     json: bool,
-    session: &'a TerminalSession,
 }
 
 impl<'a, W: Write> EventSink for RenderSink<'a, W> {
@@ -172,9 +168,15 @@ pub fn run(options: ShellOptions) -> anyhow::Result<()> {
 /// Returns an error if the session cannot be created or stdin/stdout fail.
 pub fn run_in(workspace: PathBuf, options: ShellOptions) -> anyhow::Result<()> {
     let limits = ResourceLimits::new(4 * 1024 * 1024, 120).map_err(anyhow::Error::new)?;
-    let grant = CapabilityGrant::workspace(&workspace, FilesystemAccess::ReadWrite)
-        .map_err(anyhow::Error::new)?
-        .with_limits(limits);
+    // The session overlay allowlists a small set of benign names so `export`
+    // is usable by humans; the AI path gets a stricter grant. Everything else
+    // (including secret-bearing host variables) stays out by default.
+    let mut grant = CapabilityGrant::workspace(&workspace, FilesystemAccess::ReadWrite)
+        .map_err(anyhow::Error::new)?;
+    for name in ["PATH", "HOME", "TERM", "USER"] {
+        grant = grant.allow_environment(name).map_err(anyhow::Error::new)?;
+    }
+    let grant = grant.with_limits(limits);
     let session_spec = TerminalSessionSpec {
         id: 1,
         actor: Actor::Human,
@@ -187,7 +189,6 @@ pub fn run_in(workspace: PathBuf, options: ShellOptions) -> anyhow::Result<()> {
     let parser = ShellParser::new();
     let authority = PromptAuthority {
         auto_approve: options.auto_approve_native,
-        prompted: Arc::new(Mutex::new(0)),
     };
 
     let stdin = io::stdin();
@@ -235,7 +236,6 @@ pub fn run_in(workspace: PathBuf, options: ShellOptions) -> anyhow::Result<()> {
                 let mut sink = RenderSink {
                     writer: &mut stdout,
                     json: options.json,
-                    session: &session,
                 };
                 match executor.execute(&program, &mut session, &authority, &mut sink) {
                     Ok(result) => {
@@ -265,20 +265,11 @@ mod tests {
 
     #[test]
     fn render_sink_emits_output_bytes() {
-        let session = TerminalSession::new(TerminalSessionSpec {
-            id: 1,
-            actor: Actor::Human,
-            cwd: SessionPath::new(".").expect("valid cwd"),
-            base_grant: CapabilityGrant::empty(),
-            limits: ResourceLimits::new(1024, 30).expect("valid limits"),
-        })
-        .expect("session");
         let mut output = Vec::new();
         {
             let mut sink = RenderSink {
                 writer: &mut output,
                 json: false,
-                session: &session,
             };
             sink.emit(SessionEvent::Output {
                 stream: Stream::Stdout,
@@ -291,20 +282,11 @@ mod tests {
 
     #[test]
     fn json_sink_escapes_output_bytes() {
-        let session = TerminalSession::new(TerminalSessionSpec {
-            id: 1,
-            actor: Actor::Human,
-            cwd: SessionPath::new(".").expect("valid cwd"),
-            base_grant: CapabilityGrant::empty(),
-            limits: ResourceLimits::new(1024, 30).expect("valid limits"),
-        })
-        .expect("session");
         let mut output = Vec::new();
         {
             let mut sink = RenderSink {
                 writer: &mut output,
                 json: true,
-                session: &session,
             };
             sink.emit(SessionEvent::Output {
                 stream: Stream::Stdout,
@@ -319,19 +301,22 @@ mod tests {
 
     #[test]
     fn prompt_authority_auto_approves_in_auto_mode() {
-        let authority = PromptAuthority {
-            auto_approve: true,
-            prompted: Arc::new(Mutex::new(0)),
-        };
-        // No actual request needed: auto-approve short-circuits before use.
+        let authority = PromptAuthority { auto_approve: true };
+        // Auto-approve short-circuits before reading the request, but the
+        // request must still be constructible: it needs a grant that both
+        // allows native execution and covers the working directory.
+        let root = std::env::temp_dir();
+        let grant = CapabilityGrant::workspace(&root, FilesystemAccess::Read)
+            .expect("absolute workspace")
+            .allow_native_execution();
         let request = wasi_runtime::command::CommandRequest::new(
             1,
             Actor::Agent,
             wasi_runtime::command::ExecutionMode::Native,
             "cargo",
             ["test"],
-            std::env::temp_dir(),
-            CapabilityGrant::empty().allow_native_execution(),
+            &root,
+            grant,
         )
         .expect("request");
         assert!(authority.authorize_native(&request).is_ok());
