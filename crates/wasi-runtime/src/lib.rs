@@ -9,10 +9,13 @@ pub mod broker;
 pub mod cancel;
 pub mod capability;
 pub mod command;
+pub mod elevation;
 pub mod native;
 pub mod native_session;
 pub mod pipe;
 pub mod policy;
+pub mod shell_ir;
+pub mod shell_parse;
 
 use std::sync::mpsc;
 use std::sync::{Mutex, PoisonError};

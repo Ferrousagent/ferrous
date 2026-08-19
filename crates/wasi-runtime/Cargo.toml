@@ -11,6 +11,7 @@ publish.workspace = true
 async-trait = "0.1"
 bytes = "1"
 portable-pty = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { version = "1", features = ["io-util"] }
 wasmtime = { workspace = true }

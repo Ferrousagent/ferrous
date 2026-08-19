@@ -2006,7 +2006,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "criterion",
  "portable-pty",
+ "sha2",
  "thiserror 2.0.20",
  "tokio",
  "wasmtime",
