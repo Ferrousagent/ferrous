@@ -15,6 +15,7 @@ pub mod native;
 pub mod native_session;
 pub mod pipe;
 pub mod policy;
+pub mod shell_executor;
 pub mod shell_ir;
 pub mod shell_parse;
 pub mod terminal_session;

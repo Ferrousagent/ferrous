@@ -51,6 +51,8 @@ pub struct JobHandle {
     pub digest_hex: String,
     /// Cancellation for this job.
     pub cancel: crate::cancel::CancelHandle,
+    /// Shared exit-code slot filled by the background runner when it finishes.
+    exit: std::sync::Arc<std::sync::Mutex<Option<i32>>>,
 }
 
 /// Errors produced by session operations.
@@ -260,6 +262,23 @@ impl TerminalSession {
         digest_hex: String,
         cancel: crate::cancel::CancelHandle,
     ) -> Result<u64, SessionError> {
+        self.register_job_with_exit(digest_hex, cancel)
+            .map(|(id, _)| id)
+    }
+
+    /// Register a job and receive a shared slot its runner writes the exit
+    /// code into. The slot is how background jobs report completion to the
+    /// session without sharing mutable session state across threads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::JobTableFull`] when the table is at capacity,
+    /// or [`SessionError::Closed`] when the session is closed.
+    pub fn register_job_with_exit(
+        &mut self,
+        digest_hex: String,
+        cancel: crate::cancel::CancelHandle,
+    ) -> Result<(u64, std::sync::Arc<std::sync::Mutex<Option<i32>>>), SessionError> {
         if self.closed {
             return Err(SessionError::Closed);
         }
@@ -268,8 +287,23 @@ impl TerminalSession {
         }
         let id = self.next_job_id;
         self.next_job_id = self.next_job_id.saturating_add(1);
-        self.jobs.insert(id, JobHandle { digest_hex, cancel });
-        Ok(id)
+        let exit = std::sync::Arc::new(std::sync::Mutex::new(None));
+        self.jobs.insert(
+            id,
+            JobHandle {
+                digest_hex,
+                cancel,
+                exit: exit.clone(),
+            },
+        );
+        Ok((id, exit))
+    }
+
+    /// Read a job's reported exit code, if it has finished.
+    pub fn job_exit_code(&self, id: u64) -> Option<i32> {
+        self.jobs
+            .get(&id)
+            .and_then(|handle| handle.exit.lock().ok().and_then(|slot| *slot))
     }
 
     /// Cancel one session-owned job and remove it from the table.
@@ -286,6 +320,29 @@ impl TerminalSession {
     /// Number of live jobs.
     pub fn job_count(&self) -> usize {
         self.jobs.len()
+    }
+
+    /// Create a deep snapshot of the session for a detached background job:
+    /// same spec, cwd, env, and limits, but an independent job table and no
+    /// lease. Changes made by the background job never leak back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cwd can no longer be resolved inside the grant.
+    pub fn snapshot(&self) -> Result<Self, SessionError> {
+        let root = workspace_root(&self.spec.base_grant)?;
+        let relative = self.cwd.strip_prefix(&root).unwrap_or(&self.cwd);
+        let relative = relative.to_string_lossy();
+        let mut snapshot = Self::new(TerminalSessionSpec {
+            id: self.spec.id,
+            actor: self.spec.actor,
+            cwd: SessionPath::new(relative.into_owned())
+                .map_err(|_| SessionError::PathDenied(self.cwd.clone()))?,
+            base_grant: self.spec.base_grant.clone(),
+            limits: self.spec.limits,
+        })?;
+        snapshot.env = self.env.clone();
+        Ok(snapshot)
     }
 
     /// Close the session: cancel every owned job, release the lease, and mark
