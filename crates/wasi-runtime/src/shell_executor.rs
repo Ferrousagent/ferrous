@@ -38,8 +38,10 @@ use crate::capability::{CapabilityGrant, ResourceLimits};
 use crate::command::{Actor, CommandRequest, ExecutionMode, SessionEvent, Stream};
 use crate::native::{NativeBackend, NativeError};
 use crate::native_session::NativeSessionHandle;
-use crate::shell_ir::{Builtin, CommandSpec, Program, Redirect, ShellProgram, Statement};
-use crate::terminal_session::{SessionPath, TerminalSession, TerminalSessionSpec};
+use crate::shell_ir::{
+    Builtin, CommandSpec, Program, Redirect, SessionPath, ShellProgram, Statement,
+};
+use crate::terminal_session::{TerminalSession, TerminalSessionSpec};
 
 /// How a plan ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -322,13 +324,16 @@ impl ShellExecutor {
                 // `close()` kills it, and receives the exit code on a slot.
                 let cancel = CancelHandle::new();
                 let digest = crate::shell_ir::CommandDigest::of(&ShellProgram {
-                    statements: vec![statement.clone()],
+                    statements: vec![(**statement).clone()],
                 })
                 .hex();
                 let (job_id, exit_slot) = session.register_job_with_exit(digest, cancel.clone())?;
                 let snapshot = TerminalSession::snapshot(session)?;
                 let runtime = self.runtime.clone();
                 let thread_cancel = cancel.clone();
+                // Own the statement so the 'static background thread never
+                // borrows session state.
+                let statement = (**statement).clone();
                 let background = std::thread::spawn(move || {
                     let mut snapshot = snapshot;
                     let mut sink = VecSink::default();
@@ -336,7 +341,7 @@ impl ShellExecutor {
                         runtime: runtime.clone(),
                     };
                     let result = executor.execute_statement(
-                        statement,
+                        &statement,
                         &mut snapshot,
                         &DenyNative,
                         &mut sink,
@@ -675,6 +680,25 @@ impl ShellExecutor {
         let mut handles = Vec::new();
         let mut last_exit = 1i32;
         let cancel = CancelHandle::new();
+
+        // Pre-authorize native stages on the calling thread before any stage
+        // thread starts. The authority is a short-lived reference that cannot
+        // cross into the stage threads, and collecting approval up front means
+        // a denied stage fails fast instead of after earlier stages ran.
+        for stage in stages {
+            if let Program::External(program) = &stage.program {
+                let request = CommandRequest::new(
+                    session.id(),
+                    session.actor(),
+                    ExecutionMode::Native,
+                    program.clone(),
+                    stage.args.clone(),
+                    session.cwd(),
+                    session.base_grant().clone().allow_native_execution(),
+                )?;
+                authority.authorize_native(&request)?;
+            }
+        }
 
         for (index, stage) in stages.iter().enumerate() {
             let input_rx = if index == 0 {
