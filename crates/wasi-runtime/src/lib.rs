@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod broker;
+pub mod builtin;
 pub mod cancel;
 pub mod capability;
 pub mod command;
@@ -16,6 +17,7 @@ pub mod pipe;
 pub mod policy;
 pub mod shell_ir;
 pub mod shell_parse;
+pub mod terminal_session;
 
 use std::sync::mpsc;
 use std::sync::{Mutex, PoisonError};
