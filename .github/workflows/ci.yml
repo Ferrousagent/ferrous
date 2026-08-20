@@ -57,39 +57,39 @@ jobs:
             # note, so GitHub attaches it to the source file (public API).
             sed -r 's/\x1B\[[0-9;]*[mK]//g' /tmp/clippy.txt > /tmp/clippy_clean.txt
             python3 - <<'PYEOF'
-import re
-lines = open('/tmp/clippy_clean.txt').read().splitlines()
-i = 0
-blocks = []
-while i < len(lines):
-    line = lines[i]
-    if re.match(r'^(error|warning)(\[|:)', line):
-        title = line
-        loc = ''
-        body = []
-        j = i + 1
-        while j < len(lines):
-            nxt = lines[j]
-            if re.match(r'^(error|warning)(\[|:)', nxt):
-                break
-            m = re.search(r'--> ([^:]+):(\d+):(\d+)', nxt)
-            if m and not loc:
-                loc = (m.group(1), int(m.group(2)), int(m.group(3)))
-            body.append(nxt)
-            j += 1
-        blocks.append((title, loc, body))
-        i = j
-    else:
-        i += 1
-for title, loc, body in blocks[:25]:
-    if loc:
-        path, ln, col = loc
-        print(f'::error file={path},line={ln},col={col},title=clippy::{title}')
-    else:
-        print(f'::error title=clippy::{title}')
-    for b in body[:8]:
-        print(b)
-PYEOF
+            import re
+            lines = open('/tmp/clippy_clean.txt').read().splitlines()
+            i = 0
+            blocks = []
+            while i < len(lines):
+                line = lines[i]
+                if re.match(r'^(error|warning)(\[|:)', line):
+                    title = line
+                    loc = ''
+                    body = []
+                    j = i + 1
+                    while j < len(lines):
+                        nxt = lines[j]
+                        if re.match(r'^(error|warning)(\[|:)', nxt):
+                            break
+                        m = re.search(r'--> ([^:]+):(\d+):(\d+)', nxt)
+                        if m and not loc:
+                            loc = (m.group(1), int(m.group(2)), int(m.group(3)))
+                        body.append(nxt)
+                        j += 1
+                    blocks.append((title, loc, body))
+                    i = j
+                else:
+                    i += 1
+            for title, loc, body in blocks[:25]:
+                if loc:
+                    path, ln, col = loc
+                    print(f'::error file={path},line={ln},col={col},title=clippy::{title}')
+                else:
+                    print(f'::error title=clippy::{title}')
+                for b in body[:8]:
+                    print(b)
+            PYEOF
           fi
           exit $status
 
