@@ -10,6 +10,11 @@ on:
   workflow_dispatch:
 
 # Kill stale runs when a newer push lands on the same branch.
+# TEMP-DEBUG: contents:write lets the clippy failure tail be posted as a
+# commit comment (readable via the public API). Remove with the debug step.
+permissions:
+  contents: write
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
