@@ -52,9 +52,12 @@ jobs:
           cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/clippy.txt
           status=${PIPESTATUS[0]}
           if [ $status -ne 0 ]; then
-            grep -E "^(error|warning)(\[|:)" /tmp/clippy.txt | head -30 | while IFS= read -r line; do
-              echo "::error file=.github/workflows/ci.yml,line=46,title=clippy::$line"
-            done
+            # Strip ANSI colour codes (clippy output is coloured in CI).
+            sed -r 's/\x1B\[[0-9;]*[mK]//g' /tmp/clippy.txt \
+              | grep -E "^(error|warning)(\[|:)" | head -30 \
+              | while IFS= read -r line; do
+                  echo "::error file=.github/workflows/ci.yml,line=46,title=clippy::$line"
+                done
           fi
           exit $status
 
