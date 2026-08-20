@@ -717,18 +717,16 @@ impl ShellExecutor {
 
             let handle = std::thread::spawn(move || {
                 let mut sink = VecSink::default();
-                let result = run_pipeline_stage(
-                    &stage,
-                    &runtime,
-                    input_rx,
-                    output_tx,
-                    &grant,
-                    &cwd,
+                let mut ctx = StageContext {
+                    runtime: &runtime,
+                    grant: &grant,
+                    cwd: &cwd,
                     actor,
                     limits,
-                    &stage_cancel,
-                    &mut sink,
-                );
+                    cancel: &stage_cancel,
+                    sink: &mut sink,
+                };
+                let result = run_pipeline_stage(&stage, input_rx, output_tx, &mut ctx);
                 (result, sink)
             });
             handles.push(handle);
@@ -770,19 +768,24 @@ impl ShellExecutor {
     }
 }
 
+/// Invariant context shared by every stage of one pipeline.
+struct StageContext<'a> {
+    runtime: &'a Arc<crate::WasiRuntime>,
+    grant: &'a CapabilityGrant,
+    cwd: &'a std::path::Path,
+    actor: Actor,
+    limits: ResourceLimits,
+    cancel: &'a CancelHandle,
+    sink: &'a mut VecSink,
+}
+
 /// Run one pipeline stage, feeding stdin from `input_rx` and forwarding stdout
 /// to `output_tx`, streaming any final output to `sink`.
 fn run_pipeline_stage(
     spec: &CommandSpec,
-    runtime: &Arc<crate::WasiRuntime>,
     input_rx: Option<mpsc::Receiver<Vec<u8>>>,
     output_tx: Option<SyncSender<Vec<u8>>>,
-    grant: &CapabilityGrant,
-    cwd: &std::path::Path,
-    actor: Actor,
-    limits: ResourceLimits,
-    cancel: &CancelHandle,
-    sink: &mut VecSink,
+    ctx: &mut StageContext,
 ) -> Result<i32, ExecuteError> {
     match &spec.program {
         Program::Builtin(builtin) => {
@@ -793,16 +796,16 @@ fn run_pipeline_stage(
                 .map_err(|_| ExecuteError::InvalidPlan("pipeline cwd is not a session path"))?;
             let mut session = TerminalSession::new(TerminalSessionSpec {
                 id: 0,
-                actor,
+                actor: ctx.actor,
                 cwd: cwd_path,
-                base_grant: grant.clone(),
-                limits,
+                base_grant: ctx.grant.clone(),
+                limits: ctx.limits,
             })?;
             let mut result = if matches!(builtin, Builtin::Cat(_)) {
                 let mut input = Vec::new();
                 if let Some(rx) = input_rx {
                     while let Ok(bytes) = rx.recv() {
-                        let budget = limits.max_output_bytes().saturating_sub(input.len());
+                        let budget = ctx.limits.max_output_bytes().saturating_sub(input.len());
                         if budget == 0 {
                             break;
                         }
@@ -822,27 +825,27 @@ fn run_pipeline_stage(
             if let Some(tx) = output_tx {
                 let _ = tx.send(bytes);
             } else {
-                sink.emit(SessionEvent::Output {
+                ctx.sink.emit(SessionEvent::Output {
                     stream: Stream::Stdout,
                     bytes,
                 })?;
             }
-            let _ = cancel;
             Ok(code)
         }
         Program::External(program) => {
             let request = CommandRequest::new(
                 0,
-                actor,
+                ctx.actor,
                 ExecutionMode::Native,
                 program.clone(),
                 spec.args.clone(),
-                cwd,
-                grant.clone().allow_native_execution(),
+                ctx.cwd,
+                ctx.grant.clone().allow_native_execution(),
             )?;
             let native = NativeBackend::new().spawn(&request)?;
             let (events_tx, _events_rx) = mpsc::channel();
-            let handle = NativeSessionHandle::new(native, cancel.clone(), limits, events_tx);
+            let handle =
+                NativeSessionHandle::new(native, ctx.cancel.clone(), ctx.limits, events_tx);
             // Feed the previous stage's output into this stage's PTY input.
             if let Some(input_rx) = input_rx {
                 let input_sender = handle.input_sender();
@@ -864,7 +867,7 @@ fn run_pipeline_stage(
                     if let Some(tx) = output_tx {
                         let _ = tx.send(output.stdout);
                     } else {
-                        sink.emit(SessionEvent::Output {
+                        ctx.sink.emit(SessionEvent::Output {
                             stream: Stream::Stdout,
                             bytes: output.stdout,
                         })?;
@@ -876,20 +879,20 @@ fn run_pipeline_stage(
         }
         Program::WasiComponent(component_path) => {
             // v1: WASI stages run with empty stdin (documented limit).
-            let component_bytes = std::fs::read(cwd.join(component_path))?;
-            let component = runtime.compile_component(&component_bytes)?;
+            let component_bytes = std::fs::read(ctx.cwd.join(component_path))?;
+            let component = ctx.runtime.compile_component(&component_bytes)?;
             let request = CommandRequest::new(
                 0,
-                actor,
+                ctx.actor,
                 ExecutionMode::Wasi,
                 component_path.clone(),
                 spec.args.clone(),
-                cwd,
-                grant.clone(),
+                ctx.cwd,
+                ctx.grant.clone(),
             )?;
             let (events_tx, events_rx) = mpsc::channel();
-            let runner_cancel = cancel.clone();
-            let runtime = runtime.clone();
+            let runner_cancel = ctx.cancel.clone();
+            let runtime = ctx.runtime.clone();
             let runner = std::thread::spawn(move || {
                 runtime.run_wasi_events(&component, &request, &runner_cancel, &events_tx)
             });
@@ -915,7 +918,7 @@ fn run_pipeline_stage(
             if let Some(tx) = output_tx {
                 let _ = tx.send(stdout_capture);
             } else {
-                sink.emit(SessionEvent::Output {
+                ctx.sink.emit(SessionEvent::Output {
                     stream: Stream::Stdout,
                     bytes: stdout_capture,
                 })?;

@@ -113,6 +113,7 @@ impl ApprovalLease {
     /// Panics if called outside the broker. This is enforced by convention and
     /// by keeping the constructor `pub(crate)`; the broker module is the only
     /// in-crate user.
+    #[allow(dead_code)]
     pub(crate) fn mint(
         lease_id: u128,
         session_id: u64,

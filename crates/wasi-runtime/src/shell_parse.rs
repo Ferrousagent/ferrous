@@ -417,13 +417,11 @@ impl Parser {
     }
 
     fn skip_separators(&mut self) {
-        loop {
-            match self.peek() {
-                Token::Operator(Operator::Semi) | Token::Newline => {
-                    self.next();
-                }
-                _ => break,
-            }
+        while matches!(
+            self.peek(),
+            Token::Operator(Operator::Semi) | Token::Newline
+        ) {
+            self.next();
         }
     }
 
