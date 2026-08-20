@@ -490,7 +490,7 @@ mod tests {
             &mut session,
         );
         assert_eq!(result.exit_code, 1);
-        assert!(result.stderr.iter().any(|byte| *byte == b'\n'));
+        assert!(result.stderr.contains(&b'\n'));
     }
 
     #[test]

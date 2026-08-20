@@ -44,6 +44,11 @@ pub struct EnvDelta {
     pub remove: Vec<String>,
 }
 
+/// Shared exit-code slot for a background job: `Some(code)` once the runner
+/// finishes. An `Arc<Mutex<...>>` so the detached runner thread can fill it
+/// without sharing mutable session state.
+pub type JobExitSlot = std::sync::Arc<std::sync::Mutex<Option<i32>>>;
+
 /// A session-owned background job handle.
 #[derive(Debug)]
 pub struct JobHandle {
@@ -52,7 +57,7 @@ pub struct JobHandle {
     /// Cancellation for this job.
     pub cancel: crate::cancel::CancelHandle,
     /// Shared exit-code slot filled by the background runner when it finishes.
-    exit: std::sync::Arc<std::sync::Mutex<Option<i32>>>,
+    exit: JobExitSlot,
 }
 
 /// Errors produced by session operations.
@@ -278,7 +283,7 @@ impl TerminalSession {
         &mut self,
         digest_hex: String,
         cancel: crate::cancel::CancelHandle,
-    ) -> Result<(u64, std::sync::Arc<std::sync::Mutex<Option<i32>>>), SessionError> {
+    ) -> Result<JobExitSlot, SessionError> {
         if self.closed {
             return Err(SessionError::Closed);
         }
