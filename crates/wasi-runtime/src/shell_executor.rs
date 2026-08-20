@@ -1015,8 +1015,10 @@ mod tests {
     /// A test authority that approves every native command. Used only to
     /// exercise executor sequencing; real sessions must go through the human
     /// authority.
+    #[cfg(unix)]
     struct TestApprove;
 
+    #[cfg(unix)]
     impl ApprovalAuthorityView for TestApprove {
         fn authorize_native(&self, _request: &CommandRequest) -> Result<(), ExecuteError> {
             Ok(())
