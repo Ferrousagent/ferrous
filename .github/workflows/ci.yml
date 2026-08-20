@@ -44,25 +44,17 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (deny warnings)
-        # TEMP-DEBUG: on failure, post the clippy tail as a commit comment
-        # (publicly readable via API) so the error text is reachable without
-        # admin log access. Remove once the violations are fixed.
+        # TEMP-DEBUG: emit clippy error lines as file/line ::error::
+        # annotations (visible via the public check-run annotations API).
+        # Remove once the violations are fixed.
         run: |
           set +e
           cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/clippy.txt
           status=${PIPESTATUS[0]}
           if [ $status -ne 0 ]; then
-            tail -120 /tmp/clippy.txt | python3 -c "
-          import json, os, sys, urllib.request
-          body = sys.stdin.read()
-          repo = os.environ['GITHUB_REPOSITORY']
-          sha = os.environ['GITHUB_SHA']
-          token = os.environ['GITHUB_TOKEN']
-          url = f'https://api.github.com/repos/{repo}/commits/{sha}/comments'
-          data = json.dumps({'body': '```\\n' + body[-64000:] + '\\n```'}).encode()
-          req = urllib.request.Request(url, data=data, method='POST', headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
-          urllib.request.urlopen(req)
-          "
+            grep -E "^(error|warning)(\[|:)" /tmp/clippy.txt | head -30 | while IFS= read -r line; do
+              echo "::error file=.github/workflows/ci.yml,line=46,title=clippy::$line"
+            done
           fi
           exit $status
 
