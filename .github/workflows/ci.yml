@@ -39,7 +39,12 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        # TEMP-DEBUG: mirror clippy output into the step summary so the
+        # failure is readable on the run page without admin log access.
+        run: |
+          set +e
+          cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee "$GITHUB_STEP_SUMMARY"
+          exit "${PIPESTATUS[0]}"
 
       - name: Tests
         run: cargo test --workspace --all-features
