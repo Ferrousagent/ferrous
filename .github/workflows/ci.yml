@@ -39,12 +39,16 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (deny warnings)
-        # TEMP-DEBUG: mirror clippy output into the step summary so the
-        # failure is readable on the run page without admin log access.
+        # TEMP-DEBUG: emit clippy errors as ::error:: annotations so the
+        # failure text is readable via the public check-run annotations API.
         run: |
           set +e
-          cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee "$GITHUB_STEP_SUMMARY"
-          exit "${PIPESTATUS[0]}"
+          cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/clippy.txt
+          status=${PIPESTATUS[0]}
+          grep -E "^(error|warning)(\[|:)" /tmp/clippy.txt | head -40 | while IFS= read -r line; do
+            echo "::error::$line"
+          done
+          exit $status
 
       - name: Tests
         run: cargo test --workspace --all-features
