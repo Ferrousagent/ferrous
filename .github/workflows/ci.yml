@@ -44,6 +44,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (deny warnings)
+        shell: bash
         # TEMP-DEBUG: emit clippy error lines as file/line ::error::
         # annotations (visible via the public check-run annotations API).
         # Remove once the violations are fixed.
@@ -67,6 +68,7 @@ jobs:
           exit $status
 
       - name: Tests
+        shell: bash
         # TEMP-DEBUG: emit test panics as file/line annotations.
         run: |
           set +e

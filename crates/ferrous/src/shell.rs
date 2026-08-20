@@ -19,21 +19,12 @@ use wasi_runtime::shell_parse::ShellParser;
 use wasi_runtime::terminal_session::{TerminalSession, TerminalSessionSpec};
 
 /// Options for the interactive shell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ShellOptions {
     /// Emit structured JSON records instead of rendered text.
     pub json: bool,
     /// Auto-approve native commands within the workspace (CI/test harness).
     pub auto_approve_native: bool,
-}
-
-impl Default for ShellOptions {
-    fn default() -> Self {
-        Self {
-            json: false,
-            auto_approve_native: false,
-        }
-    }
 }
 
 /// A human-facing approval authority backed by an interactive prompt.
@@ -73,7 +64,7 @@ impl ApprovalAuthorityView for PromptAuthority {
                 matches!(answer.as_str(), "y" | "yes")
             })
             .unwrap_or(false);
-        let _ = write!(stdout, "\n");
+        let _ = writeln!(stdout);
         let _ = stdout.flush();
         if approved {
             Ok(())
@@ -125,7 +116,7 @@ impl<'a, W: Write> EventSink for RenderSink<'a, W> {
             return Ok(());
         }
         match event {
-            SessionEvent::Output { stream, bytes } => {
+            SessionEvent::Output { stream: _, bytes } => {
                 let _ = self.writer.write_all(&bytes);
                 let _ = self.writer.flush();
             }
