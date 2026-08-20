@@ -283,7 +283,7 @@ impl TerminalSession {
         &mut self,
         digest_hex: String,
         cancel: crate::cancel::CancelHandle,
-    ) -> Result<JobExitSlot, SessionError> {
+    ) -> Result<(u64, JobExitSlot), SessionError> {
         if self.closed {
             return Err(SessionError::Closed);
         }
