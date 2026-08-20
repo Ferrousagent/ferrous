@@ -69,16 +69,23 @@ jobs:
 
       - name: Tests
         shell: bash
-        # TEMP-DEBUG: emit test panics as file/line annotations.
+        # TEMP-DEBUG: isolate package/test hangs and expose the bounded tail.
         run: |
           set +e
-          cargo test --workspace --all-features 2>&1 | tee /tmp/tests.txt
-          status=${PIPESTATUS[0]}
+          : > /tmp/tests.txt
+          timeout 300 cargo test -p wasi-runtime --all-features -- --nocapture --test-threads=1 2>&1 | tee -a /tmp/tests.txt
+          runtime_status=${PIPESTATUS[0]}
+          if [ $runtime_status -eq 0 ]; then
+            timeout 300 cargo test --workspace --exclude wasi-runtime --all-features -- --nocapture --test-threads=1 2>&1 | tee -a /tmp/tests.txt
+            workspace_status=${PIPESTATUS[0]}
+          else
+            workspace_status=0
+          fi
+          status=$runtime_status
+          [ $status -eq 0 ] && status=$workspace_status
           if [ $status -ne 0 ]; then
-            # Keep the public diagnostics bounded while preserving the actual
-            # failure tail when a platform test process exits unexpectedly.
             sed -r 's/\x1B\[[0-9;]*[mK]//g' /tmp/tests.txt \
-              | tail -80 \
+              | tail -120 \
               | while IFS= read -r line; do
                   [ -n "$line" ] && echo "::error file=.github/workflows/ci.yml,line=75,title=test-output::$line"
                 done
