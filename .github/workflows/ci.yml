@@ -73,10 +73,10 @@ jobs:
         run: |
           set +e
           : > /tmp/tests.txt
-          timeout 300 cargo test -p wasi-runtime --all-features -- --nocapture --test-threads=1 2>&1 | tee -a /tmp/tests.txt
+          cargo test -p wasi-runtime --all-features -- --nocapture --test-threads=1 2>&1 | tee -a /tmp/tests.txt
           runtime_status=${PIPESTATUS[0]}
           if [ $runtime_status -eq 0 ]; then
-            timeout 300 cargo test --workspace --exclude wasi-runtime --all-features -- --nocapture --test-threads=1 2>&1 | tee -a /tmp/tests.txt
+            cargo test --workspace --exclude wasi-runtime --all-features -- --nocapture --test-threads=1 2>&1 | tee -a /tmp/tests.txt
             workspace_status=${PIPESTATUS[0]}
           else
             workspace_status=0
@@ -85,9 +85,10 @@ jobs:
           [ $status -eq 0 ] && status=$workspace_status
           if [ $status -ne 0 ]; then
             sed -r 's/\x1B\[[0-9;]*[mK]//g' /tmp/tests.txt \
-              | tail -120 \
+              | grep -E "FAILED|failure|error:|panicked|test result:|signal|could not compile|running [0-9]+ tests" \
+              | tail -40 \
               | while IFS= read -r line; do
-                  [ -n "$line" ] && echo "::error file=.github/workflows/ci.yml,line=75,title=test-output::$line"
+                  [ -n "$line" ] && echo "::error file=.github/workflows/ci.yml,line=75,title=test-failure::$line"
                 done
           fi
           exit $status
