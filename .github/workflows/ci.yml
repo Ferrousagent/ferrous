@@ -52,9 +52,10 @@ jobs:
           cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/clippy.txt
           status=${PIPESTATUS[0]}
           if [ $status -ne 0 ]; then
-            # Strip ANSI colour codes (clippy output is coloured in CI).
+            # Strip ANSI colour codes (clippy output is coloured in CI) and
+            # pair each error/warning line with its `--> file:line` note.
             sed -r 's/\x1B\[[0-9;]*[mK]//g' /tmp/clippy.txt \
-              | grep -E "^(error|warning)(\[|:)" | head -30 \
+              | grep -A1 -E "^(error|warning)(\[|:)" | head -60 \
               | while IFS= read -r line; do
                   echo "::error file=.github/workflows/ci.yml,line=46,title=clippy::$line"
                 done
