@@ -718,10 +718,10 @@ mod tests {
 
     #[test]
     fn parses_and_or_sequence_and_redirects() {
-        let program = parse("mkdir -p src && cd src || echo failed; ls > out.txt").expect("parses");
+        let program = parse("mkdir src && cd src || echo failed; ls > out.txt").expect("parses");
         let statements = &program.statements;
         assert_eq!(statements.len(), 2);
-        // `mkdir -p src && cd src || echo failed` -> Or(And(mkdir, cd), echo)
+        // `mkdir src && cd src || echo failed` -> Or(And(mkdir, cd), echo)
         let Statement::Or(left, _right) = &statements[0] else {
             panic!("expected Or");
         };
