@@ -48,16 +48,16 @@ jobs:
           status=${PIPESTATUS[0]}
           if [ $status -ne 0 ]; then
             tail -120 /tmp/clippy.txt | python3 -c "
-import json, os, sys, urllib.request
-body = sys.stdin.read()
-repo = os.environ['GITHUB_REPOSITORY']
-sha = os.environ['GITHUB_SHA']
-token = os.environ['GITHUB_TOKEN']
-url = f'https://api.github.com/repos/{repo}/commits/{sha}/comments'
-data = json.dumps({'body': '```\\n' + body[-64000:] + '\\n```'}).encode()
-req = urllib.request.Request(url, data=data, method='POST', headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
-urllib.request.urlopen(req)
-"
+          import json, os, sys, urllib.request
+          body = sys.stdin.read()
+          repo = os.environ['GITHUB_REPOSITORY']
+          sha = os.environ['GITHUB_SHA']
+          token = os.environ['GITHUB_TOKEN']
+          url = f'https://api.github.com/repos/{repo}/commits/{sha}/comments'
+          data = json.dumps({'body': '```\\n' + body[-64000:] + '\\n```'}).encode()
+          req = urllib.request.Request(url, data=data, method='POST', headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+          urllib.request.urlopen(req)
+          "
           fi
           exit $status
 
