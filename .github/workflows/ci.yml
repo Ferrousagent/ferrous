@@ -10,8 +10,8 @@ on:
   workflow_dispatch:
 
 # Kill stale runs when a newer push lands on the same branch.
-# TEMP-DEBUG: contents:write lets the clippy failure tail be posted as a
-# commit comment (readable via the public API). Remove with the debug step.
+# TEMP-DEBUG: contents:write lets the test-failure tail be posted as a
+# commit comment (readable via the public API). Remove once CI is green.
 permissions:
   contents: write
 
@@ -44,35 +44,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (deny warnings)
-        shell: bash
-        # TEMP-DEBUG: emit clippy error lines as file/line ::error::
-        # annotations (visible via the public check-run annotations API).
-        # Remove once the violations are fixed.
-        run: |
-          set +e
-          cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/clippy.txt
-          status=${PIPESTATUS[0]}
-          if [ $status -ne 0 ]; then
-            # Strip ANSI colour codes and emit each clippy error as one
-            # annotation with real file/line metadata parsed from the `-->`
-            # note, so GitHub attaches it to the source file (public API).
-            sed -r 's/\x1B\[[0-9;]*[mK]//g' /tmp/clippy.txt \
-              | awk '/^(error|warning)(\[|:)/ { title=$0; getline; \
-                      if ($0 ~ /-->/ ) { loc=$0; sub(/^.*--> /, "", loc); \
-                        n=split(loc, q, ":"); \
-                        if (n == 3) { printf "::error file=%s,line=%s,col=%s::%s\n", q[1], q[2], q[3], title } \
-                        else { print "::error::" title } } \
-                      else { print "::error::" title } }' \
-              | head -40
-          fi
-          exit $status
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Tests
         shell: bash
-        # TEMP-DEBUG: on failure, emit the failing test names and panic
-        # lines as check-run annotations with UNIQUE line numbers so GitHub
-        # preserves their order (shared file/line scrambles the sort).
-        # Remove once CI is green.
+        # TEMP-DEBUG: on failure, post the tail of the test output as a
+        # commit comment (readable via the public commits API). Remove once
+        # CI is green; requires the contents: write permission below.
         run: |
           set +e
           : > /tmp/tests.txt
@@ -87,18 +65,39 @@ jobs:
           status=$runtime_status
           [ $status -eq 0 ] && status=$workspace_status
           if [ $status -ne 0 ]; then
-            command -v python3 >/dev/null 2>&1 && PY=python3 || PY=python
-            $PY -c "
-            import re
-            n = 0
-            for raw in open('/tmp/tests.txt', errors='replace'):
-                line = raw.rstrip()
-                if re.search(r'FAILED\b|panicked at|test result: FAILED|^failures:$|^error: test failed|^error\\[E[0-9]+\\]|^error: could not compile|^    [a-z_]+::', line):
-                    n += 1
-                    print('::error file=crates/wasi-runtime/src/lib.rs,line=' + str(n) + ',title=test-failure::' + line[:240])
-            " 2>/dev/null | head -60
+            {
+              echo "Tests failed on $RUNNER_OS (exit $status):"
+              echo '```'
+              tail -120 /tmp/tests.txt | cut -c1-200
+              echo '```'
+            } > /tmp/comment-body.md
           fi
           exit $status
+
+      - name: Upload test log (diagnostic)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ matrix.os }}
+          path: /tmp/tests.txt
+          if-no-files-found: ignore
+
+      - name: Prepare failure report
+        id: prepare
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f /tmp/comment-body.md ]; then
+            echo "report_ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "report_ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report test failures on commit
+        if: steps.prepare.outputs.report_ready == 'true'
+        uses: peter-evans/commit-comment@v4
+        with:
+          body-path: /tmp/comment-body.md
 
       - name: Docs (broken links are errors)
         env:
