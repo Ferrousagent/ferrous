@@ -884,7 +884,9 @@ mod tests {
             parse("(echo hi)"),
             Err(ParseError::UnsupportedConstruct(_))
         ));
-        assert!(matches!(parse(";"), Err(ParseError::EmptyCommand)));
+        // `;` alone is all separators: no statements survive, so it is an
+        // empty input rather than a command with a missing program.
+        assert!(matches!(parse(";"), Err(ParseError::EmptyInput)));
     }
 
     #[test]
