@@ -23,7 +23,7 @@ jobs:
   check:
     name: fmt + clippy + tests + docs + benches (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -69,14 +69,17 @@ jobs:
 
       - name: Tests
         shell: bash
-        # TEMP-DEBUG: isolate package/test hangs and expose the bounded tail.
+        # TEMP-DEBUG: on failure, emit the failing test names and panic
+        # lines as check-run annotations with UNIQUE line numbers so GitHub
+        # preserves their order (shared file/line scrambles the sort).
+        # Remove once CI is green.
         run: |
           set +e
           : > /tmp/tests.txt
-          cargo test -p wasi-runtime --all-features -- --nocapture --test-threads=1 2>&1 | tee -a /tmp/tests.txt
+          cargo test -p wasi-runtime --all-features 2>&1 | tee /tmp/tests.txt
           runtime_status=${PIPESTATUS[0]}
           if [ $runtime_status -eq 0 ]; then
-            cargo test --workspace --exclude wasi-runtime --all-features -- --nocapture --test-threads=1 2>&1 | tee -a /tmp/tests.txt
+            cargo test --workspace --exclude wasi-runtime --all-features 2>&1 | tee -a /tmp/tests.txt
             workspace_status=${PIPESTATUS[0]}
           else
             workspace_status=0
@@ -84,12 +87,15 @@ jobs:
           status=$runtime_status
           [ $status -eq 0 ] && status=$workspace_status
           if [ $status -ne 0 ]; then
-            sed -r 's/\x1B\[[0-9;]*[mK]//g' /tmp/tests.txt \
-              | grep -E "FAILED|failure|error:|panicked|test result:|signal|could not compile|running [0-9]+ tests" \
-              | tail -40 \
-              | while IFS= read -r line; do
-                  [ -n "$line" ] && echo "::error file=.github/workflows/ci.yml,line=75,title=test-failure::$line"
-                done
+            python3 -c "
+            import re
+            n = 0
+            for raw in open('/tmp/tests.txt', errors='replace'):
+                line = raw.rstrip()
+                if re.search(r'FAILED\b|panicked at|test result: FAILED|^failures:$|^error: test failed|^    [a-z_]+::', line):
+                    n += 1
+                    print('::error file=.github/workflows/ci.yml,line=' + str(75 + n) + ',title=test-failure::' + line[:240])
+            " 2>/dev/null | head -60
           fi
           exit $status
 

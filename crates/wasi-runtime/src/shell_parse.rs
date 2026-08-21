@@ -711,7 +711,12 @@ mod tests {
     fn preserves_quoted_metacharacters_as_one_argument() {
         let program = parse(r#"echo "a | b" 'c && d'"#).expect("parses");
         let spec = command_of(&program);
-        assert_eq!(spec.args, ["a | b", "c && d"]);
+        // Builtin argv is stored inside the builtin, not in the spec's
+        // leftover `args` (which stays empty for builtins).
+        let Program::Builtin(Builtin::Echo(args)) = &spec.program else {
+            panic!("expected echo builtin");
+        };
+        assert_eq!(args, ["a | b", "c && d"]);
     }
 
     #[test]
@@ -774,8 +779,12 @@ mod tests {
         let Statement::Pipeline(stages) = &program.statements[0] else {
             panic!("expected pipeline");
         };
-        assert_eq!(stages[0].args, ["a;b"]);
-        assert_eq!(stages[1].args, ["c>d"]);
+        for (stage, expected) in stages.iter().zip(["a;b", "c>d"]) {
+            let Program::Builtin(Builtin::Echo(args)) = &stage.program else {
+                panic!("expected echo builtin");
+            };
+            assert_eq!(args, [expected]);
+        }
     }
 
     #[test]
