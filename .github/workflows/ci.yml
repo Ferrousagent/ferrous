@@ -87,14 +87,15 @@ jobs:
           status=$runtime_status
           [ $status -eq 0 ] && status=$workspace_status
           if [ $status -ne 0 ]; then
-            python3 -c "
+            command -v python3 >/dev/null 2>&1 && PY=python3 || PY=python
+            $PY -c "
             import re
             n = 0
             for raw in open('/tmp/tests.txt', errors='replace'):
                 line = raw.rstrip()
-                if re.search(r'FAILED\b|panicked at|test result: FAILED|^failures:$|^error: test failed|^    [a-z_]+::', line):
+                if re.search(r'FAILED\b|panicked at|test result: FAILED|^failures:$|^error: test failed|^error\\[E[0-9]+\\]|^error: could not compile|^    [a-z_]+::', line):
                     n += 1
-                    print('::error file=.github/workflows/ci.yml,line=' + str(75 + n) + ',title=test-failure::' + line[:240])
+                    print('::error file=crates/wasi-runtime/src/lib.rs,line=' + str(n) + ',title=test-failure::' + line[:240])
             " 2>/dev/null | head -60
           fi
           exit $status
