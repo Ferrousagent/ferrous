@@ -716,7 +716,7 @@ mod tests {
         let Program::Builtin(Builtin::Echo(args)) = &spec.program else {
             panic!("expected echo builtin");
         };
-        assert_eq!(args, ["a | b", "c && d"]);
+        assert_eq!(*args, ["a | b", "c && d"]);
     }
 
     #[test]
@@ -783,7 +783,7 @@ mod tests {
             let Program::Builtin(Builtin::Echo(args)) = &stage.program else {
                 panic!("expected echo builtin");
             };
-            assert_eq!(args, [expected]);
+            assert_eq!(*args, [expected]);
         }
     }
 
