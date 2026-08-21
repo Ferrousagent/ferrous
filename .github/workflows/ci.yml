@@ -41,52 +41,10 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Build tests
-        run: cargo test -p wasi-runtime --lib --all-features --no-run
-
-      - name: Tests (per-module isolation)
-        shell: bash
-        # TEMP-DEBUG: run each wasi-runtime test module separately with a
-        # hard timeout so a hang/OOM is attributed to its module instead of
-        # freezing the whole suite. Full log is read via `gh run view --log`.
-        # Remove once the freeze is fixed.
+      - name: Tests
         run: |
-          set +e
-          BIN=
-          for f in $(ls -t target/debug/deps/wasi_runtime-* 2>/dev/null); do
-            if [ -f "$f" ] && [ -x "$f" ]; then BIN="$f"; break; fi
-          done
-          if [ -z "$BIN" ]; then echo "test binary not found"; exit 1; fi
-          echo "BIN=$BIN"
-          command -v python3 >/dev/null 2>&1 && PY=python3 || PY=python
-          mods="shell_parse shell_ir shell_executor builtin terminal_session broker contract_tests native native_session elevation policy pipe capability command cancel"
-          failed=0
-          for m in $mods; do
-            echo "=== MODULE: $m ==="
-            $PY -c "
-          import subprocess, sys
-          try:
-              proc = subprocess.run([sys.argv[1], sys.argv[2] + '::'], timeout=110)
-              sys.exit(proc.returncode)
-          except subprocess.TimeoutExpired:
-              print('TIMED OUT after 110s:', sys.argv[2])
-              sys.exit(124)
-          " "$BIN" "$m"
-            s=$?
-            if [ $s -eq 124 ] || [ $s -eq 137 ]; then
-              echo "!!! MODULE HUNG/KILLED: $m (exit $s)"
-              failed=1
-            elif [ $s -ne 0 ]; then
-              echo "!!! MODULE FAILED: $m (exit $s)"
-              failed=1
-            fi
-          done
-          echo "=== wasi-runtime modules done (failed=$failed) ==="
-          exit $failed
-
-      - name: Tests (other crates)
-        shell: bash
-        run: cargo test --workspace --exclude wasi-runtime --all-features
+          cargo test -p wasi-runtime --all-features
+          cargo test --workspace --exclude wasi-runtime --all-features
 
       - name: Docs (broken links are errors)
         env:
