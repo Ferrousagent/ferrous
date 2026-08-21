@@ -195,8 +195,19 @@ pub fn run_in(workspace: PathBuf, options: ShellOptions) -> anyhow::Result<()> {
         "Try: `pwd`, `ls`, `cd sub`, `mkdir newdir`, `echo hi`, `export FOO=bar`, `npm test` (needs approval), `exit`"
     );
 
-    for line in stdin.lock().lines() {
-        let line = line?;
+    loop {
+        // Interactive prompt; JSON mode stays machine-readable.
+        if !options.json {
+            let _ = write!(stdout, "ferrous> ");
+            let _ = stdout.flush();
+        }
+        let mut line = String::new();
+        let read = stdin.lock().read_line(&mut line);
+        match read {
+            Ok(0) => break, // EOF closes the session.
+            Ok(_) => {}
+            Err(_) => break,
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;

@@ -2,6 +2,7 @@
 
 mod cli;
 mod shell;
+mod wterm;
 
 use clap::Parser;
 
@@ -12,6 +13,10 @@ fn main() -> anyhow::Result<()> {
         cli::Command::Shell(args) => shell::run(shell::ShellOptions {
             json: args.json,
             auto_approve_native: args.auto_approve_native,
+        }),
+        cli::Command::Wterm(args) => wterm::run(wterm::WtermOptions {
+            host: args.host,
+            port: args.port,
         }),
     }
 }
