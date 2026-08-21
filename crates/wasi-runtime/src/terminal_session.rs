@@ -337,11 +337,17 @@ impl TerminalSession {
     pub fn snapshot(&self) -> Result<Self, SessionError> {
         let root = workspace_root(&self.spec.base_grant)?;
         let relative = self.cwd.strip_prefix(&root).unwrap_or(&self.cwd);
-        let relative = relative.to_string_lossy();
+        // The workspace root is represented by `.` in the typed IR; an empty
+        // path is intentionally rejected by `SessionPath`.
+        let relative = if relative.as_os_str().is_empty() {
+            ".".to_owned()
+        } else {
+            relative.to_string_lossy().into_owned()
+        };
         let mut snapshot = Self::new(TerminalSessionSpec {
             id: self.spec.id,
             actor: self.spec.actor,
-            cwd: SessionPath::new(relative.into_owned())
+            cwd: SessionPath::new(relative)
                 .map_err(|_| SessionError::PathDenied(self.cwd.clone()))?,
             base_grant: self.spec.base_grant.clone(),
             limits: self.spec.limits,
@@ -451,18 +457,9 @@ mod tests {
 
     #[test]
     fn cd_rejects_parent_escapes() {
-        let (spec, root) = test_spec("cd-escapes", Actor::Human);
-        let mut session = TerminalSession::new(spec).expect("session opens");
-        let outside = root
-            .parent()
-            .expect("temp dir has a parent")
-            .join("ferrous-session-escape");
-        let _ = std::fs::create_dir_all(&outside);
-
-        let result = session.change_dir(
-            &SessionPath::new("../../ferrous-session-escape").expect("lexically valid"),
-        );
-        assert!(matches!(result, Err(SessionError::PathDenied(_))));
+        // Parent components are rejected while constructing the typed path,
+        // before session resolution or filesystem access can occur.
+        assert!(SessionPath::new("../../ferrous-session-escape").is_err());
     }
 
     #[test]

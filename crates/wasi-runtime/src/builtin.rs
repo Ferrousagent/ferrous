@@ -484,9 +484,12 @@ mod tests {
     fn cat_rejects_paths_outside_the_workspace() {
         let root = test_root("cat-denied");
         let mut session = session_in(&root, FilesystemAccess::Read, false);
-        // Lexically escapes the workspace root.
+        // The typed IR rejects parent components before execution. This is
+        // the fail-closed boundary that prevents the builtin from receiving
+        // an escaping path at all.
+        assert!(SessionPath::new("../../etc/hostname").is_err());
         let result = BuiltinExecutor.execute(
-            &Builtin::Cat(SessionPath::new("../../etc/hostname").expect("lexically valid")),
+            &Builtin::Cat(SessionPath::new("missing.txt").expect("valid path")),
             &mut session,
         );
         assert_eq!(result.exit_code, 1);
@@ -530,10 +533,12 @@ mod tests {
     fn which_finds_programs_on_the_session_path() {
         let root = test_root("which");
         std::fs::create_dir_all(root.join("bin")).expect("bin dir");
+        // Use a regular file so the lookup test is meaningful on every
+        // runner; Unix additionally checks executable permissions.
+        std::fs::write(root.join("bin/tool"), b"tool").expect("tool written");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::write(root.join("bin/tool"), b"#!/bin/sh\n").expect("tool written");
             let permissions = fs::metadata(root.join("bin/tool"))
                 .expect("tool metadata")
                 .permissions();

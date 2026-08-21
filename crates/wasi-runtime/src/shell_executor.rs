@@ -1096,31 +1096,10 @@ mod tests {
     }
 
     #[test]
-    fn redirection_cannot_write_outside_the_grant() {
-        let (mut session, _root) = test_session("redirect-deny");
-        let executor = ShellExecutor::new().expect("executor");
-        let spec = CommandSpec {
-            program: Program::Builtin(Builtin::Echo(vec!["data".to_owned()])),
-            args: Vec::new(),
-            redirects: vec![Redirect::OutputTruncate(
-                SessionPath::new("../../escape.txt").expect("lexically valid"),
-            )],
-            cwd: SessionPath::new(".").expect("valid cwd"),
-        };
-        let program = ShellProgram {
-            statements: vec![Statement::Command(spec)],
-        };
-        let mut sink = VecSink::default();
-        let result = executor.execute(&program, &mut session, &DenyNative, &mut sink);
-        assert!(
-            matches!(
-                result,
-                Err(ExecuteError::Session(
-                    crate::terminal_session::SessionError::PathDenied(_)
-                ))
-            ),
-            "redirect escape must be denied, got {result:?}"
-        );
+    fn redirection_rejects_parent_components_before_execution() {
+        // Parent components are rejected by the typed IR before redirect
+        // resolution can reach the filesystem.
+        assert!(SessionPath::new("../../escape.txt").is_err());
     }
 
     #[test]
