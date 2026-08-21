@@ -294,10 +294,12 @@ impl<'a> Tokenizer<'a> {
                         self.push_word(std::mem::take(&mut current))?;
                         has_current = false;
                     }
+                    self.position += 1;
                 }
                 _ => {
                     current.push(character);
                     has_current = true;
+                    self.position += 1;
                 }
             }
         }
@@ -405,11 +407,15 @@ impl Parser {
                 return Err(ParseError::TooManyStatements(self.limits.max_statements));
             }
             let statement = self.parse_statement()?;
+            let background = matches!(statement, Statement::Background(_));
             statements.push(statement);
-            // After a statement, expect a separator or end.
+            // After a statement, expect a separator or end. A trailing `&`
+            // already acts as a separator, so the next token may begin a
+            // new statement (e.g. `npm test & echo done`).
             match self.peek() {
                 Token::Operator(Operator::Semi) | Token::Newline | Token::End => {}
                 Token::Operator(Operator::And) | Token::Operator(Operator::Or) => {}
+                _ if background => {}
                 _ => return Err(ParseError::InvalidOperator("expected separator")),
             }
         }
@@ -485,6 +491,11 @@ impl Parser {
                 Token::Word(word) => {
                     words.push(word.clone());
                     self.next();
+                }
+                Token::Operator(Operator::OpenParen) | Token::Operator(Operator::CloseParen) => {
+                    return Err(ParseError::UnsupportedConstruct(
+                        "subshell or command substitution `$( ... )`",
+                    ));
                 }
                 Token::Operator(Operator::RedirectIn)
                 | Token::Operator(Operator::RedirectOut)
