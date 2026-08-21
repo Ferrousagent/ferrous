@@ -302,12 +302,36 @@ fn run_terminal_loop<S: Read + Write>(
         }
 
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(_)) => {
+                // The child may have written final output (e.g. `bye`) that
+                // is still buffered; drain it before closing the socket.
+                drain_with_deadline(socket, &receiver)?;
+                break;
+            }
             Ok(None) => {}
             Err(_) => break,
         }
     }
     Ok(())
+}
+
+/// Relay any output the pty reader still holds for up to a short deadline.
+fn drain_with_deadline<S: Read + Write>(
+    socket: &mut WebSocket<S>,
+    receiver: &std::sync::mpsc::Receiver<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(bytes) => {
+                if socket.send(Message::Binary(bytes.into())).is_err() {
+                    return Ok(());
+                }
+            }
+            Err(_) => return Ok(()),
+        }
+    }
 }
 
 /// Handle a client control message. Only `{"resize":[cols,rows]}` is defined.
