@@ -10,11 +10,6 @@ on:
   workflow_dispatch:
 
 # Kill stale runs when a newer push lands on the same branch.
-# TEMP-DEBUG: contents:write lets the test-failure tail be posted as a
-# commit comment (readable via the public API). Remove once CI is green.
-permissions:
-  contents: write
-
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -46,58 +41,52 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Tests
+      - name: Build tests
+        run: cargo test -p wasi-runtime --lib --all-features --no-run
+
+      - name: Tests (per-module isolation)
         shell: bash
-        # TEMP-DEBUG: on failure, post the tail of the test output as a
-        # commit comment (readable via the public commits API). Remove once
-        # CI is green; requires the contents: write permission below.
+        # TEMP-DEBUG: run each wasi-runtime test module separately with a
+        # hard timeout so a hang/OOM is attributed to its module instead of
+        # freezing the whole suite. Full log is read via `gh run view --log`.
+        # Remove once the freeze is fixed.
         run: |
           set +e
-          : > /tmp/tests.txt
-          cargo test -p wasi-runtime --all-features 2>&1 | tee /tmp/tests.txt
-          runtime_status=${PIPESTATUS[0]}
-          if [ $runtime_status -eq 0 ]; then
-            cargo test --workspace --exclude wasi-runtime --all-features 2>&1 | tee -a /tmp/tests.txt
-            workspace_status=${PIPESTATUS[0]}
-          else
-            workspace_status=0
-          fi
-          status=$runtime_status
-          [ $status -eq 0 ] && status=$workspace_status
-          if [ $status -ne 0 ]; then
-            {
-              echo "Tests failed on $RUNNER_OS (exit $status):"
-              echo '```'
-              tail -120 /tmp/tests.txt | cut -c1-200
-              echo '```'
-            } > /tmp/comment-body.md
-          fi
-          exit $status
+          BIN=
+          for f in $(ls -t target/debug/deps/wasi_runtime-* 2>/dev/null); do
+            if [ -f "$f" ] && [ -x "$f" ]; then BIN="$f"; break; fi
+          done
+          if [ -z "$BIN" ]; then echo "test binary not found"; exit 1; fi
+          echo "BIN=$BIN"
+          command -v python3 >/dev/null 2>&1 && PY=python3 || PY=python
+          mods="shell_parse shell_ir shell_executor builtin terminal_session broker contract_tests native native_session elevation policy pipe capability command cancel"
+          failed=0
+          for m in $mods; do
+            echo "=== MODULE: $m ==="
+            $PY -c "
+          import subprocess, sys
+          try:
+              proc = subprocess.run([sys.argv[1], sys.argv[2] + '::'], timeout=110)
+              sys.exit(proc.returncode)
+          except subprocess.TimeoutExpired:
+              print('TIMED OUT after 110s:', sys.argv[2])
+              sys.exit(124)
+          " "$BIN" "$m"
+            s=$?
+            if [ $s -eq 124 ] || [ $s -eq 137 ]; then
+              echo "!!! MODULE HUNG/KILLED: $m (exit $s)"
+              failed=1
+            elif [ $s -ne 0 ]; then
+              echo "!!! MODULE FAILED: $m (exit $s)"
+              failed=1
+            fi
+          done
+          echo "=== wasi-runtime modules done (failed=$failed) ==="
+          exit $failed
 
-      - name: Upload test log (diagnostic)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-log-${{ matrix.os }}
-          path: /tmp/tests.txt
-          if-no-files-found: ignore
-
-      - name: Prepare failure report
-        id: prepare
-        if: failure()
+      - name: Tests (other crates)
         shell: bash
-        run: |
-          if [ -f /tmp/comment-body.md ]; then
-            echo "report_ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "report_ready=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Report test failures on commit
-        if: steps.prepare.outputs.report_ready == 'true'
-        uses: peter-evans/commit-comment@v4
-        with:
-          body-path: /tmp/comment-body.md
+        run: cargo test --workspace --exclude wasi-runtime --all-features
 
       - name: Docs (broken links are errors)
         env:
