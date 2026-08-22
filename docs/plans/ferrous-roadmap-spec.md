@@ -44,7 +44,7 @@ These answers override any ambiguity in the original `plan`.
 | Secrets & env vars | **Encrypted private data.** User-provided secrets live in a per-profile encrypted store (vault-backed) and are injected as **environment variables only into capability-scoped sandboxes at runtime** — never plaintext on disk, never in logs/audit. |
 | Rich agent plans | **Structured plans, not wall-of-text.** The agent loop emits a typed plan model (steps, status, files, risks, diffs); chat renders it with real fonts/colors/cards/spacing and interactive approve/edit. Model is backend (Phase 4); rendering is UI (Phase 6). |
 | Research feature set | From surveying Cursor / Windsurf / Copilot / Devin / Manus / Claude Code: **checkpoints & AI-undo** (auto local git repo), **background agents** (local-only, while the PC is on), **ask/interview mode** (read-only Q&A), **custom slash commands**, **@-mentions**, **self-evolving agent** (installs skills/MCP/plugins with approval), **deploy & preview via the user's MCP hosting**. Skipped for now: model playground, worktree isolation, hooks, auto-fix loop, test/debugger integration, mission-control panel, NL terminal. |
-| WASI screen (right panel) | A **VS Code-style terminal + a WASI-rendered headless-browser view** the AI uses to browse, click buttons, and test — like Vercel Agent Browser, **no multimodal model**. Headless core early; rendered view in the UI phase. |
+| WASI screen (right panel) | A **VS Code-style terminal + a rendered browser/preview view** the AI uses to browse, click buttons, and test — like Vercel Agent Browser, **no multimodal model**. WASI is the default AI tool path; real host commands use an approval-based native backend. Headless core early; rendered view in the UI phase. |
 | Model runtime | **Hybrid from day one** — local + cloud with auto-routing. |
 | "Ferrous OS / kernel" | **Deferred.** Treat as an in-app **fast WASI runtime + shell**. The literal "custom Linux kernel" is unrealistic for now and is descoped. |
 | Platforms | **Universal** via Tauri bundler: `.deb` (Linux), `.exe` (Windows), `.dmg/.app` (macOS). |
@@ -97,7 +97,7 @@ These answers override any ambiguity in the original `plan`.
 └───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **`wasi-runtime`** — embedded Wasmtime + WASI preview 2 / component model, capability grants, shell/REPL, headless browser core, and the sandbox framework every subsystem uses. This is the "Ferrous OS" centerpiece.
+- **`wasi-runtime`** — embedded Wasmtime + WASI preview 2 / component model, capability grants, safe AI shell/REPL, and the sandbox framework every subsystem uses. Native terminal/preview processes and external browser control remain separate policy adapters; this is the "Ferrous OS" centerpiece.
 - **`context-index` (Graphify)** — tree-sitter AST graph + LSP semantics + optional embeddings; feeds the loop token-budgeted context. Also defines the canvas-mirror data contract early.
 - **`agent-loop`** — custom Rust agent: plan/act/observe, tool registry, **subagents**, **skills runtime** (WASM-component skills), **structured plan model** (steps/status/risks/diffs), state persistence, interrupt.
 - **`router`** — custom Rust cost/latency/capability calculator + COTP token pipeline + Mermaid agent routing (task → agents/subagents).
@@ -138,10 +138,13 @@ The substrate everything else runs on — including the sandbox-everything rule.
   Capability-based sandbox: no ambient authority, explicit grant of stdio/fs/net.
   - **AC:** Load and run a WASI component with only granted capabilities; ungranted access fails closed.
   - **RT:** WASI preview 2 vs 3 maturity; async component bindings.
-- **T1.2 — WASI shell / REPL (CLI-first).** The `ferrous shell` runs WASI components, streams
-  stdio, tracks cwd/env, enforces per-command capability grants. This is the **verification
-  surface for every backend phase**; the Tauri terminal render comes in the UI phase.
-  - **AC:** Type a WASI command, see streamed output; `exit`/signals work; killed processes free resources.
+- **T1.2 — Two-mode shell / REPL (CLI-first).** The `ferrous shell` uses one terminal event
+  protocol for WASI components and an approval-based native backend for real `bash`, `npm`,
+  `cargo`, and `git`. WASI is the default AI path; native execution must use direct argv for
+  AI requests, PTY/process-group or ConPTY/process-tree handling, bounded output, cancellation,
+  and hard failure when the host cannot enforce its policy. The Tauri terminal render comes
+  in the UI phase.
+  - **AC:** Type a WASI command and see streamed output; start an explicitly approved native session; `exit`/signals/cancel work; killed processes free all resources; unsupported native policy never falls back ambiently.
 - **T1.3 — Headless browser core.** A lightweight headless browser the AI controls to browse,
   click, and test. Headless-only now — the human-facing render comes in the UI phase. No multimodal model.
   - **AC:** AI can navigate a URL, read simplified DOM/text, click an element, and read the result — all from the CLI.
@@ -218,8 +221,9 @@ The loop that turns routing + context + tools into autonomous work. Consumes Pha
 - **T4.1 — Agent loop core.** Plan/act/observe state machine, tool registry, iteration budget,
   structured step output; deterministic and resumable; context assembled via the Phase 3 interface.
   - **AC:** An agent plans, calls tools, observes, and terminates on a fixed multi-step task.
-- **T4.2 — Tool primitives.** File read/write/edit (patch), run (WASI shell), search (stub → Phase 5),
-  browse (T1.3). Tools are capability-gated through the WASI sandbox framework (T1.4).
+- **T4.2 — Tool primitives.** File read/write/edit (patch), run (WASI or approved native shell),
+  search (stub → Phase 5), browse (T1.3). Tools are capability-gated through the WASI sandbox
+  framework (T1.4) or the native process policy adapter; no tool silently bypasses the broker.
   - **AC:** Each tool is individually testable and sandboxed; hostile paths are denied.
 - **T4.3 — Subagents.** Orchestrator spawns specialised subagents with focused context, tool
   subsets, and budget isolation; results marshaled back to the orchestrator. Mermaid routing
@@ -303,8 +307,9 @@ All UI ships last, on top of fully working, CLI-verified backends.
 - **T6.3 — Stage editor (CodeMirror 6).** File tree, tabs, syntax highlighting, LSP hookup, and the
   inline completion surface wired to the completion engine (T5.8).
   - **AC:** Edit/save files, navigate the tree, tabs behave; completions stream from T5.8.
-- **T6.4 — WASI screen render (right panel).** Terminal view (T1.2) + rendered headless-browser
-  view (T1.3) in one panel; human watches while AI operates.
+- **T6.4 — WASI screen render (right panel).** Terminal view (T1.2) + rendered browser/preview
+  view (T1.3) in one panel; human watches while AI operates. Project previews use a separate
+  least-privileged WebView or browser context with no main-window Tauri authority.
   - **AC:** Human sees AI terminal output and browser clicks live.
 - **T6.5 — Floating chat + collapsible sidebar.** Chat bar anchored to the agent loop; sidebar
   navigation hosting the MCP marketplace (T5.5) and Skills store (T5.6) surfaces.
@@ -405,12 +410,14 @@ The "zero-pixel vision" differentiator. Implements the Phase 3 data contract.
 9. Profile model — single-user multi-profile vs multi-user on one machine; master-password
    rotation/recovery UX.
 10. Sandbox level — in-process WASI capability scoping vs OS process isolation per subsystem
-    (LSP hosting in T3.2 will pressure this decision).
+    (LSP hosting in T3.2 and native terminal/preview hosting in Phase 1 will pressure this decision).
 11. Plan-model schema versioning and the human edit/approve surface (CLI-first, then chat UI).
 12. Secret rotation/expiry and the per-environment injection policy.
 13. Self-evolving agent governance — what may it auto-install without approval, and the approval threshold.
 14. Background agents: PC-on semantics (pause on sleep/lock, resume on wake) and scheduled-task cadence.
 15. Model playground — deferred unless trivial; revisit after the router (T2.3).
+16. Preview/browser network policy — finalize loopback port allocation, browser proxy/interception,
+    redirect/DNS handling, and the minimum supported native sandbox on each desktop OS.
 
 ---
 

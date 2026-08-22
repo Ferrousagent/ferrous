@@ -14,9 +14,12 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+portable-pty = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tungstenite = { workspace = true }
 shared = { path = "../shared", version = "0.1.0" }
+wasi-runtime = { path = "../wasi-runtime", version = "0.1.0" }
 
 [dev-dependencies]
 assert_cmd = "2"

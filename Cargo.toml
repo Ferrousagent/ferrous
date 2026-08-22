@@ -32,6 +32,12 @@ clap = { version = "4", features = ["derive"] }
 # secrets leave the crate only via an explicit `expose_secret()` boundary.
 secrecy = "0.10"
 criterion = "0.5"
+wasmtime = { version = "47.0.3", default-features = false, features = ["async", "component-model", "component-model-async", "cranelift", "runtime", "std", "wit-parser"] }
+wasmtime-wasi = { version = "47.0.3", default-features = false, features = ["p2"] }
+wat = "1"
+portable-pty = "0.9"
+sha2 = "0.10"
+tungstenite = "0.30"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

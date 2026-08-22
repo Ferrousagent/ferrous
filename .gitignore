@@ -18,3 +18,7 @@ logs
 !.vscode/extensions.json
 .idea
 .DS_Store
+
+# Local AI-tooling config (not part of the project)
+/.opencode/
+/opencode.json

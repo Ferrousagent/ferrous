@@ -1,0 +1,369 @@
+//! Native session driver: runs one PTY session to completion while streaming
+//! output, enforcing the output budget, watching cancellation and the
+//! wall-clock deadline, and forwarding keystrokes into the child.
+//!
+//! Threads (all owned by [`NativeSessionHandle::run`]):
+//!
+//! - **reader thread** — drains the PTY, accumulates and forwards
+//!   `SessionEvent::Output` chunks, and kills the child once the combined
+//!   output budget is exceeded;
+//! - **watchdog thread** — kills the child when the session is cancelled or
+//!   the wall-clock deadline passes, recording the reason;
+//! - **input thread** — receives bytes from the broker's `send_input` channel
+//!   and writes them to the PTY master.
+//!
+//! On Unix the PTY child is a session leader, so killing it takes down its
+//! whole process group (grandchildren included); on Windows the ConPTY
+//! implementation owns the process tree. Every path through `run` joins all
+//! three threads, so no task, fd, or process leaks.
+
+use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
+
+use crate::cancel::CancelHandle;
+use crate::capability::ResourceLimits;
+use crate::command::{SessionEvent, Stream};
+use crate::native::{NativeError, NativeOutput, NativeSession, drain_reader};
+
+/// How `run` ended, distinguishing a normal exit from a policy stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeStop {
+    /// The child exited on its own.
+    Exited,
+    /// The session was cancelled before the child completed.
+    Cancelled,
+    /// The wall-clock deadline passed and the child was killed.
+    TimedOut,
+    /// The combined output budget was exceeded and the child was killed.
+    OutputLimit,
+}
+
+/// One running native session and its control threads.
+pub struct NativeSessionHandle {
+    session: NativeSession,
+    cancel: CancelHandle,
+    limits: ResourceLimits,
+    sink: Sender<SessionEvent>,
+    input_tx: Sender<Vec<u8>>,
+    input_rx: Receiver<Vec<u8>>,
+}
+
+impl NativeSessionHandle {
+    /// Wrap a spawned session for a broker-managed run.
+    pub fn new(
+        session: NativeSession,
+        cancel: CancelHandle,
+        limits: ResourceLimits,
+        sink: Sender<SessionEvent>,
+    ) -> Self {
+        let (input_tx, input_rx) = mpsc::channel();
+        Self {
+            session,
+            cancel,
+            limits,
+            sink,
+            input_tx,
+            input_rx,
+        }
+    }
+
+    /// A sender the broker stores so `send_input(id, bytes)` reaches this
+    /// session's PTY writer.
+    pub fn input_sender(&self) -> Sender<Vec<u8>> {
+        self.input_tx.clone()
+    }
+
+    /// Run the session to completion. The caller emits `Started` first and a
+    /// terminal `SessionEvent` after this returns, mirroring the WASI path.
+    pub fn run(mut self) -> Result<NativeOutput, NativeError> {
+        let budget = self.limits.max_output_bytes();
+        let deadline = Instant::now() + Duration::from_secs(self.limits.timeout_seconds());
+
+        // Split the session's handles before spawning threads so each thread
+        // owns what it touches and the borrow checker can prove it.
+        let reader = self.session.try_clone_reader()?;
+        let writer = self.session.take_writer();
+        let killer = self.session.child_killer();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let watchdog_stop = stop.clone();
+        let reader_stop = stop.clone();
+
+        let kill_reason = Arc::new(std::sync::Mutex::new(None::<NativeStop>));
+        let watchdog_reason = kill_reason.clone();
+        let reader_reason = kill_reason.clone();
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let reader_captured = captured.clone();
+
+        // Watchdog: enforce cancellation + wall-clock deadline by killing the
+        // child and recording WHY it was killed.
+        let watchdog_cancel = self.cancel.clone();
+        let mut watchdog_killer = killer.clone_killer();
+        let watchdog = std::thread::spawn(move || {
+            loop {
+                if watchdog_stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                if watchdog_cancel.is_cancelled() {
+                    let _ = watchdog_killer.kill();
+                    *watchdog_reason
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(NativeStop::Cancelled);
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    let _ = watchdog_killer.kill();
+                    *watchdog_reason
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(NativeStop::TimedOut);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+
+        // Reader: drain the PTY, accumulate output, stream events, and cut the
+        // guest off once the combined budget is exceeded.
+        let reader_sink = self.sink.clone();
+        let reader = std::thread::spawn(move || {
+            let mut exceeded = false;
+            let _ = drain_reader(reader, &mut |chunk| {
+                if reader_stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                let (accepted, overflowed) = {
+                    let mut captured = reader_captured
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let remaining = budget.saturating_sub(captured.len());
+                    let accepted = chunk.len().min(remaining);
+                    captured.extend_from_slice(&chunk[..accepted]);
+                    (accepted, chunk.len() > accepted)
+                };
+                if overflowed && !exceeded {
+                    exceeded = true;
+                    let _ = killer.clone_killer().kill();
+                    *reader_reason
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(NativeStop::OutputLimit);
+                }
+                if accepted > 0 {
+                    let _ = reader_sink.send(SessionEvent::Output {
+                        stream: Stream::Stdout,
+                        bytes: chunk[..accepted].to_vec(),
+                    });
+                }
+            });
+            let _ = exceeded;
+        });
+
+        // Input: forward keystrokes from the broker channel into the PTY.
+        // Use a bounded receive timeout: the broker intentionally keeps a
+        // cloned sender in its live-session map until `run` returns, so this
+        // thread must observe teardown independently of sender destruction.
+        let input_rx = self.input_rx;
+        let input_stop = stop.clone();
+        let input = std::thread::spawn(move || {
+            let mut writer = match writer {
+                Some(writer) => writer,
+                None => return,
+            };
+            while !input_stop.load(Ordering::SeqCst) {
+                match input_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(bytes) => {
+                        let _ = writer.write_all(&bytes);
+                        let _ = writer.flush();
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+
+        // Main loop: poll the child until it exits (the watchdog or the
+        // reader kills it on policy stops, which makes try_wait return).
+        let exit_code;
+        loop {
+            if let Some(status) = self.session.try_exit_status()? {
+                exit_code = status;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Teardown, in an order that cannot deadlock:
+        // 1. Kill the child first (no-op if already exited) so the reader's
+        //    blocked PTY read returns instead of hanging forever.
+        // 2. Stop the watchdog so it cannot kill after a clean exit, join it.
+        // 3. Drop the input sender and join the input thread.
+        // 4. Join the reader and collect the captured output.
+        let _ = self.session.kill();
+        stop.store(true, Ordering::SeqCst);
+        let _ = watchdog.join();
+        drop(self.input_tx);
+        let _ = input.join();
+        let _ = reader.join();
+
+        let output = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        match kill_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or(NativeStop::Exited)
+        {
+            NativeStop::Exited => Ok(NativeOutput {
+                stdout: output,
+                stderr: Vec::new(),
+                exit_code,
+            }),
+            NativeStop::Cancelled => Err(NativeError::Cancelled),
+            NativeStop::TimedOut => Err(NativeError::Timeout),
+            NativeStop::OutputLimit => Err(NativeError::OutputLimit),
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::capability::{CapabilityGrant, FilesystemAccess, ResourceLimits};
+    use crate::command::{Actor, CommandRequest, ExecutionMode};
+    use crate::native::NativeBackend;
+
+    #[cfg(unix)]
+    fn native_request(program: &str, args: &[&str], limits: ResourceLimits) -> CommandRequest {
+        let root = std::env::temp_dir().join(format!(
+            "ferrous-native-session-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let grant = CapabilityGrant::workspace(&root, FilesystemAccess::ReadWrite)
+            .expect("absolute workspace")
+            .allow_native_execution()
+            .with_limits(limits);
+        CommandRequest::new(
+            1,
+            Actor::Agent,
+            ExecutionMode::Native,
+            program,
+            args.iter().copied(),
+            root,
+            grant,
+        )
+        .expect("valid native request")
+    }
+
+    #[cfg(unix)]
+    fn run_request(
+        request: &CommandRequest,
+        cancel: CancelHandle,
+    ) -> Result<NativeOutput, NativeError> {
+        let session = NativeBackend::new().spawn(request)?;
+        let (events, _receiver) = mpsc::channel();
+        NativeSessionHandle::new(session, cancel, request.grant.limits(), events).run()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_budget_stops_a_chatty_process() {
+        let limits = ResourceLimits::new(1024, 30).expect("valid limits");
+        let request = native_request("/bin/sh", &["-c", "yes x"], limits);
+        let result = run_request(&request, CancelHandle::new());
+        assert!(matches!(result, Err(NativeError::OutputLimit)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_limit_never_emits_bytes_beyond_the_declared_budget() {
+        let budget = 64;
+        let limits = ResourceLimits::new(budget, 30).expect("valid limits");
+        let request = native_request("/bin/sh", &["-c", "yes x"], limits);
+        let session = NativeBackend::new()
+            .spawn(&request)
+            .expect("session spawns");
+        let (events, receiver) = mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            NativeSessionHandle::new(session, CancelHandle::new(), request.grant.limits(), events)
+                .run()
+        });
+
+        let mut emitted = 0usize;
+        while let Ok(event) = receiver.recv_timeout(Duration::from_secs(5)) {
+            if let SessionEvent::Output { bytes, .. } = event {
+                emitted = emitted.saturating_add(bytes.len());
+            }
+        }
+        let result = runner.join().expect("session thread joins");
+        assert!(matches!(result, Err(NativeError::OutputLimit)));
+        assert!(
+            emitted <= budget,
+            "output events emitted {emitted} bytes for a {budget}-byte budget"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_kills_the_native_process_tree() {
+        let limits = ResourceLimits::new(4096, 30).expect("valid limits");
+        let request = native_request(
+            "/bin/sh",
+            &[
+                "-c",
+                "sleep 300 & child=$!; printf '%s\\n' \"$child\"; wait",
+            ],
+            limits,
+        );
+        let cancel = CancelHandle::new();
+        let runner_cancel = cancel.clone();
+        let session = NativeBackend::new()
+            .spawn(&request)
+            .expect("session spawns");
+        let (events, receiver) = mpsc::channel();
+        let handle =
+            NativeSessionHandle::new(session, runner_cancel, request.grant.limits(), events);
+        let runner = std::thread::spawn(move || handle.run());
+
+        let mut child_pid = None;
+        for _ in 0..20 {
+            if let Ok(SessionEvent::Output { bytes, .. }) =
+                receiver.recv_timeout(Duration::from_millis(250))
+            {
+                let text = String::from_utf8_lossy(&bytes);
+                child_pid = text
+                    .split_whitespace()
+                    .find_map(|value| value.parse::<u32>().ok());
+                if child_pid.is_some() {
+                    break;
+                }
+            }
+        }
+        cancel.cancel();
+        let result = runner.join().expect("session thread joins");
+        assert!(matches!(result, Err(NativeError::Cancelled)));
+        let pid = child_pid.expect("shell reported its grandchild pid");
+
+        for _ in 0..20 {
+            let still_alive = std::process::Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .expect("kill is available")
+                .success();
+            if !still_alive {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("cancelled native process left grandchild pid {pid} alive");
+    }
+}

@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ferrous · wterm</title>
+  <style>
+    html, body, #root {
+      height: 100%;
+      margin: 0;
+      background: #0b0b0f;
+    }
+    #root {
+      display: flex;
+      flex-direction: column;
+    }
+    #root > div {
+      flex: 1;
+      min-height: 0;
+      padding: 8px;
+    }
+    .wterm-status {
+      position: fixed;
+      bottom: 10px;
+      right: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      color: #6b7280;
+      pointer-events: none;
+      z-index: 10;
+    }
+    .wterm-status.connected {
+      color: #34d399;
+    }
+  </style>
+  <link rel="stylesheet" href="/wterm.css" />
+</head>
+<body>
+  <div id="root"></div>
+  <div class="wterm-status" id="status">connecting…</div>
+  <script type="module">
+    import React, { useRef, useEffect, useState } from "https://esm.sh/react@18";
+    import { createRoot } from "https://esm.sh/react-dom@18/client";
+    import { Terminal } from "https://esm.sh/@wterm/react@0.3.4";
+
+    function App() {
+      const termRef = useRef(null);
+      const wsRef = useRef(null);
+      const [connected, setConnected] = useState(false);
+
+      useEffect(() => {
+        let closed = false;
+        let ws = null;
+        let reconnectTimer = null;
+        let reconnectDelay = 1000;
+
+        const connect = () => {
+          if (closed) return;
+          const protocol = location.protocol === "https:" ? "wss" : "ws";
+          ws = new WebSocket(`${protocol}://${location.host}/ws`);
+          ws.binaryType = "arraybuffer";
+          wsRef.current = ws;
+
+          ws.onopen = () => {
+            reconnectDelay = 1000;
+            setConnected(true);
+            termRef.current?.focus();
+          };
+          ws.onmessage = (event) => {
+            const data = event.data;
+            if (data instanceof ArrayBuffer) {
+              termRef.current?.write(new Uint8Array(data));
+            } else {
+              termRef.current?.write(data);
+            }
+          };
+          ws.onclose = () => {
+            setConnected(false);
+            if (closed) return;
+            reconnectTimer = setTimeout(connect, reconnectDelay);
+            reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+          };
+        };
+        connect();
+
+        return () => {
+          closed = true;
+          if (reconnectTimer) clearTimeout(reconnectTimer);
+          ws?.close();
+        };
+      }, []);
+
+      const send = (data) => {
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(data);
+        }
+      };
+
+      const onData = (data) => {
+        send(new TextEncoder().encode(data));
+      };
+
+      const onResize = (cols, rows) => {
+        send(JSON.stringify({ resize: [cols, rows] }));
+      };
+
+      return (
+        <>
+          <Terminal
+            ref={termRef}
+            cols={100}
+            rows={30}
+            wasmUrl="/wterm.wasm"
+            autoResize
+            cursorBlink
+            theme="theme-monokai"
+            onData={onData}
+            onResize={onResize}
+          />
+          <div
+            className={"wterm-status" + (connected ? " connected" : "")}
+            id="status"
+          >
+            {connected ? "connected" : "connecting…"}
+          </div>
+        </>
+      );
+    }
+
+    createRoot(document.getElementById("root")).render(
+      React.createElement(App)
+    );
+  </script>
+</body>
+</html>
