@@ -151,6 +151,17 @@ fn ws_read_frame(stream: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
     Some((opcode, payload))
 }
 
+/// Emulate the one piece of terminal behaviour the PTY depends on: ConPTY on
+/// Windows asks the terminal for its cursor position (`ESC[6n`) and holds the
+/// child's output/input until it answers. A real terminal emulator (wterm)
+/// replies automatically; the test client must too, or Windows never streams
+/// the banner or echoes keystrokes.
+fn answer_terminal_queries(stream: &mut TcpStream, payload: &[u8]) {
+    if payload.windows(3).any(|window| window == b"\x1b[6n") {
+        ws_send_binary(stream, b"\x1b[1;1R");
+    }
+}
+
 /// Read frames until all `needles` appear in the accumulated text.
 fn read_until(stream: &mut TcpStream, needles: &[&str]) -> String {
     let mut collected = String::new();
@@ -158,6 +169,7 @@ fn read_until(stream: &mut TcpStream, needles: &[&str]) -> String {
         match ws_read_frame(stream) {
             Some((0x8, _)) => break, // close frame
             Some((_, payload)) => {
+                answer_terminal_queries(stream, &payload);
                 collected.push_str(&String::from_utf8_lossy(&payload));
                 if needles.iter().all(|needle| collected.contains(needle)) {
                     break;
@@ -175,7 +187,10 @@ fn read_all(stream: &mut TcpStream) -> String {
     loop {
         match ws_read_frame(stream) {
             Some((0x8, _)) => break,
-            Some((_, payload)) => collected.push_str(&String::from_utf8_lossy(&payload)),
+            Some((_, payload)) => {
+                answer_terminal_queries(stream, &payload);
+                collected.push_str(&String::from_utf8_lossy(&payload));
+            }
             None => break,
         }
     }
