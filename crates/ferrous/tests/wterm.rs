@@ -157,7 +157,7 @@ fn ws_read_frame(stream: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
 /// replies automatically; the test client must too, or Windows never streams
 /// the banner or echoes keystrokes.
 fn answer_terminal_queries(stream: &mut TcpStream, payload: &[u8]) {
-    if payload.windows(3).any(|window| window == b"\x1b[6n") {
+    if payload.windows(4).any(|window| window == b"\x1b[6n") {
         ws_send_binary(stream, b"\x1b[1;1R");
     }
 }
